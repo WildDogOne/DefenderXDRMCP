@@ -23,6 +23,7 @@ from fastmcp import FastMCP
 from fastmcp.server.providers.openapi.routing import MCPType, RouteMap
 
 from .auth import build_http_client
+from .schema_sanitize import sanitize_component
 
 SPEC_RESOURCE = resources.files("defender_xdr_mcp.openapi").joinpath("security.generated.yaml")
 
@@ -50,6 +51,9 @@ def build_server() -> FastMCP:
         client=build_http_client(),
         name="defender-xdr",
         route_maps=ROUTE_MAPS,
+        # Graph's OData property names ($top, @odata.type, ...) contain characters the MCP tool
+        # schema validator rejects - see schema_sanitize.py for why and how this is reversible.
+        mcp_component_fn=sanitize_component,
     )
 
 

@@ -30,6 +30,14 @@ this project uses. It would need a separate, continuously-running Event Hub cons
 | `security_UpdateIncidents` | `PATCH /security/incidents/{id}` | **mutates** the tenant's incident (status, classification, assignment, etc.)                               |
 | `security_runHuntingQuery` | `POST /security/runHuntingQuery` | runs a KQL query against Defender's event tables (read-only against tenant data, but modeled as an action) |
 
+Microsoft Graph's OpenAPI spec uses OData conventions (`$top`, `$select`, `@odata.type`, ...) for
+query parameters and some body properties. Those characters (`$`, `@`) aren't valid in an MCP tool
+schema's property names, so without intervention 3 of these 4 tools get silently dropped from the
+tool list entirely. `src/defender_xdr_mcp/schema_sanitize.py` renames them (`$top` → `top`,
+`@odata.type` → `odata.type`) in the schema shown to the model, and transparently translates
+arguments back to the real OData names before the request is built — so the model sees clean
+parameter names and Graph still gets what it expects on the wire.
+
 Only `security_UpdateIncidents` writes anything. If you wire this into an MCP client with
 allow/ask permission rules (e.g. Claude Code), put the other three in `allow` and this one in
 `ask` — see `src/defender_xdr_mcp/server.py` for the route-map that makes this split explicit.
