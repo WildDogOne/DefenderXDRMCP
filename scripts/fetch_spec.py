@@ -1,4 +1,4 @@
-"""Generate openapi/security.generated.yaml from Microsoft's own Graph v1.0 OpenAPI spec.
+"""Generate src/defender_xdr_mcp/openapi/security.generated.yaml from Microsoft's own Graph v1.0 OpenAPI spec.
 
 Downloads the full (~40+ MB) spec published by Microsoft at
 https://github.com/microsoftgraph/msgraph-metadata and slices out just the operations this
@@ -24,7 +24,13 @@ from typing import Any
 import yaml
 
 SOURCE_URL = "https://raw.githubusercontent.com/microsoftgraph/msgraph-metadata/master/openapi/v1.0/openapi.yaml"
-OUTPUT_PATH = Path(__file__).resolve().parent.parent / "openapi" / "security.generated.yaml"
+OUTPUT_PATH = (
+    Path(__file__).resolve().parent.parent
+    / "src"
+    / "defender_xdr_mcp"
+    / "openapi"
+    / "security.generated.yaml"
+)
 
 # Paths -> the HTTP methods we keep on each. Everything else on these paths (create/delete/
 # mergeIncidents/$count/etc.) is dropped: it's outside the two capabilities the Defender XDR docs

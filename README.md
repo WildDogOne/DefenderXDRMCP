@@ -48,7 +48,7 @@ on Microsoft Graph:
 Grant admin consent, then create a client secret. You'll need the **tenant ID**, **client ID**,
 and **client secret**.
 
-## Setup
+## Setup (for developing/regenerating the spec)
 
 ```bash
 uv sync
@@ -62,27 +62,44 @@ Regenerating the spec (e.g. after a Microsoft Graph update):
 uv run python scripts/fetch_spec.py
 ```
 
+## Installing it as a standalone command
+
+The generated `openapi/security.generated.yaml` ships as package data (under
+`src/defender_xdr_mcp/openapi/`), loaded via `importlib.resources` rather than a path relative to
+the repo checkout — so, unlike a plain `uv run --directory /path/to/repo`, the installed command
+below has no dependency on this directory still existing or being readable by whatever spawns it:
+
+```bash
+uv tool install .          # from a checkout, or:
+uv tool install git+https://github.com/WildDogOne/DefenderXDRMCP   # directly from GitHub
+```
+
+This puts a `defender-xdr-mcp` executable on `~/.local/bin` (run `uv tool update-shell` once if
+it's not already on your `PATH`), runnable from anywhere, independent of this checkout.
+
 ## Wiring into Claude Code
 
-This runs over **stdio**, so add it to `~/.claude.json` (or `.mcp.json`) the way you'd add any
-locally-run MCP server:
+This runs over **stdio**. MCP server subprocesses do **not** inherit Claude Code's environment
+automatically — even if `AZURE_TENANT_ID`/`AZURE_CLIENT_ID`/`AZURE_CLIENT_SECRET` are set wherever
+Claude Code itself runs, they still have to be passed explicitly, either via `--env` on `claude mcp
+add` or the `env` field in `.mcp.json`.
 
-```json
-{
-  "mcpServers": {
-    "defender-xdr": {
-      "type": "stdio",
-      "command": "uv",
-      "args": [
-        "run",
-        "--directory",
-        "/home/linus/Documents/git/DefenderXDRMCP",
-        "defender-xdr-mcp"
-      ]
-    }
-  }
-}
+```bash
+claude mcp add --scope user \
+  --env AZURE_TENANT_ID=<your-tenant-id> \
+  --env AZURE_CLIENT_ID=<your-client-id> \
+  --env AZURE_CLIENT_SECRET=<your-client-secret> \
+  defender-xdr \
+  -- defender-xdr-mcp
 ```
+
+No `--directory` and no path to this repo anywhere in that command — it only works once
+`defender-xdr-mcp` is installed and on `PATH` per the previous section.
+
+If you'd rather the literal secret not sit in your shell history either: export the three
+`AZURE_*` variables in your own shell/secret manager first, then hand-edit `.mcp.json` yourself
+with `"env": {"AZURE_TENANT_ID": "${AZURE_TENANT_ID}", ...}` — Claude Code expands `${VAR}` from
+your environment at startup, so the secret itself never needs to appear in any file or command.
 
 Then extend `~/.claude/settings.json`'s `permissions.allow` / `permissions.ask` the same way it's
 already split for the other connected MCP servers: the three read-only tools in `allow`,
