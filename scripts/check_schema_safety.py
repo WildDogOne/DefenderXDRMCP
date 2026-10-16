@@ -2,13 +2,13 @@
 import asyncio
 import re
 
-from defender_xdr_mcp.server import build_server
+from defender_xdr_mcp.server import TOOLSETS, build_server
 
 SAFE = re.compile(r"^[a-zA-Z0-9_.-]{1,64}$")
 
 
 async def main() -> None:
-    server = build_server()
+    server = build_server(TOOLSETS)
     tools = await server.list_tools()
     all_ok = True
     for tool in tools:

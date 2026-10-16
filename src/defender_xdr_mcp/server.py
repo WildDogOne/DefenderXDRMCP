@@ -11,11 +11,19 @@ location on disk. That's deliberate: `uv tool install` (and any other install pa
 editable install, a zipped package) copies the *package* into an isolated environment but does not
 carry along loose files that sit outside it, so a "few parents up from __file__" path breaks the
 moment this stops being run straight out of a source checkout.
+
+Toolsets (GRAPH_MCP_TOOLSETS, comma-separated, default "xdr"):
+- xdr:   the generated Incidents + Advanced Hunting tools.
+- graph: three read-only tools that reach all of Graph v1.0 via search -> describe -> get
+         (see graph_tools.py). Off by default to keep the agent's context small.
 """
 
 from __future__ import annotations
 
+import os
+from collections.abc import Iterable
 from importlib import resources
+from typing import Any
 
 import yaml
 from dotenv import load_dotenv
@@ -23,9 +31,13 @@ from fastmcp import FastMCP
 from fastmcp.server.providers.openapi.routing import MCPType, RouteMap
 
 from .auth import build_http_client
+from .graph_tools import register_graph_tools
 from .schema_sanitize import sanitize_component
 
 SPEC_RESOURCE = resources.files("defender_xdr_mcp.openapi").joinpath("security.generated.yaml")
+
+TOOLSETS = ("xdr", "graph")
+DEFAULT_TOOLSETS = ("xdr",)
 
 # GET -> read-only tool (list_incidents, get_incidents).
 # PATCH -> mutating tool (update_incidents) - writes to the tenant's incident record.
@@ -42,19 +54,44 @@ ROUTE_MAPS = [
 ]
 
 
-def build_server() -> FastMCP:
-    load_dotenv()  # picks up .env in the current working directory, if present
-    spec = yaml.safe_load(SPEC_RESOURCE.read_text())
+def _customize_component(route: Any, component: Any) -> None:
+    # Drop the generated output schema: it's the full nested Graph response model (~18 KB per
+    # incident tool, ~90% of each tool's definition) and only serves to validate responses, which
+    # the agent doesn't need. Responses still come back as structured JSON.
+    component.output_schema = None
+    # Graph's OData property names ($top, @odata.type, ...) contain characters the MCP tool
+    # schema validator rejects - see schema_sanitize.py for why and how this is reversible.
+    sanitize_component(route, component)
 
-    return FastMCP.from_openapi(
-        openapi_spec=spec,
-        client=build_http_client(),
-        name="defender-xdr",
-        route_maps=ROUTE_MAPS,
-        # Graph's OData property names ($top, @odata.type, ...) contain characters the MCP tool
-        # schema validator rejects - see schema_sanitize.py for why and how this is reversible.
-        mcp_component_fn=sanitize_component,
-    )
+
+def selected_toolsets() -> tuple[str, ...]:
+    raw = os.environ.get("GRAPH_MCP_TOOLSETS", "")
+    toolsets = tuple(t.strip().lower() for t in raw.split(",") if t.strip()) or DEFAULT_TOOLSETS
+    unknown = sorted(set(toolsets) - set(TOOLSETS))
+    if unknown:
+        raise RuntimeError(f"Unknown GRAPH_MCP_TOOLSETS value(s) {unknown}; valid: {list(TOOLSETS)}")
+    return toolsets
+
+
+def build_server(toolsets: Iterable[str] | None = None) -> FastMCP:
+    load_dotenv()  # picks up .env in the current working directory, if present
+    toolsets = set(selected_toolsets() if toolsets is None else toolsets)
+    client = build_http_client()
+
+    if "xdr" in toolsets:
+        server = FastMCP.from_openapi(
+            openapi_spec=yaml.safe_load(SPEC_RESOURCE.read_text()),
+            client=client,
+            name="defender-xdr",
+            route_maps=ROUTE_MAPS,
+            mcp_component_fn=_customize_component,
+        )
+    else:
+        server = FastMCP(name="defender-xdr")
+
+    if "graph" in toolsets:
+        register_graph_tools(server, client)
+    return server
 
 
 def main() -> None:

@@ -7,11 +7,11 @@ Usage:
 
 import asyncio
 
-from defender_xdr_mcp.server import build_server
+from defender_xdr_mcp.server import TOOLSETS, build_server
 
 
 async def main() -> None:
-    server = build_server()
+    server = build_server(TOOLSETS)
     tools = await server.list_tools()
     for tool in tools:
         print(f"--- {tool.name} ---")

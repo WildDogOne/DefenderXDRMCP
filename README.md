@@ -9,6 +9,10 @@ Graph v1.0 OpenAPI spec and trims it to just those operations; `FastMCP.from_ope
 trimmed spec into the four MCP tools below. When Microsoft changes the underlying API, re-running
 the generator picks it up — nothing here needs hand-editing to stay in sync.
 
+Beyond that default, an opt-in **`graph` toolset** gives read-only access to *all* of Microsoft
+Graph v1.0 (e.g. for an Entra ID configuration review) through three discovery tools, without
+loading thousands of tool definitions into the agent's context. See [Toolsets](#toolsets).
+
 ## Why Graph, not the legacy Defender API
 
 The XDR-specific advanced hunting endpoint (`api.security.microsoft.com`) is being retired (retirement began January
@@ -21,7 +25,43 @@ The **Event Streaming API** (push-based, Defender → Azure Event Hubs/Storage) 
 of scope: it's not a request/response endpoint, so it doesn't fit the OpenAPI-to-MCP-tool pattern
 this project uses. It would need a separate, continuously-running Event Hub consumer component.
 
-## Tools
+## Toolsets
+
+Select toolsets with `GRAPH_MCP_TOOLSETS` (comma-separated). Default: `xdr`.
+
+| Toolset | Tools                                                     | Context cost (tool definitions) |
+|---------|-----------------------------------------------------------|---------------------------------|
+| `xdr`   | the four generated Defender XDR tools below               | ~21 KB                          |
+| `graph` | `graph_search_operations`, `graph_describe_operation`, `graph_get` | ~3.5 KB, regardless of API size |
+
+`GRAPH_MCP_TOOLSETS=xdr,graph` enables both; `GRAPH_MCP_TOOLSETS=graph` runs only the generic tools.
+
+### `graph`: all of Graph v1.0, discovered on demand
+
+Generating one tool per operation doesn't scale to the whole API (~9,400 GET operations, each
+carrying its own schema). The `graph` toolset lets the agent find and call what it needs instead:
+
+| Tool                       | Does                                                                                                                                    |
+|----------------------------|-----------------------------------------------------------------------------------------------------------------------------------------|
+| `graph_search_operations`  | keyword search over every v1.0 GET operation (path, summary, description)                                                              |
+| `graph_describe_operation` | supported OData options, response properties (with enum values), sub-paths and the docs link (which lists required permissions) for one path; or the properties of one type |
+| `graph_get`                | **GET-only** request to `https://graph.microsoft.com/v1.0` with `select`/`filter`/`top`/`expand`/`orderby`/`search`/`count`; follows `@odata.nextLink` |
+
+Search and describe read `openapi/graph_index.json.gz`, a compact index that `scripts/fetch_spec.py`
+builds from the same upstream spec — so this toolset is spec-driven too, it just isn't
+one-tool-per-operation. Notes:
+
+- `graph_get` refuses non-GET methods, absolute URLs on any other host or API version (the bearer
+  token is only ever sent to Graph v1.0), and `..` path segments.
+- Responses larger than `GRAPH_MCP_MAX_RESPONSE_CHARS` (default 60000) are trimmed to whole items,
+  with a note saying how many were dropped — use `select` and `top` to stay under it.
+- `/me` paths are hidden from search: app-only auth has no signed-in user.
+- Beta-only endpoints aren't covered.
+
+What `graph_get` can actually read is set by the app registration's permissions, not by this code —
+see [App registration](#app-registration).
+
+## Tools (`xdr` toolset)
 
 | Tool                       | Graph operation                  | Type                                                                                                       |
 |----------------------------|----------------------------------|------------------------------------------------------------------------------------------------------------|
@@ -37,6 +77,9 @@ tool list entirely. `src/defender_xdr_mcp/schema_sanitize.py` renames them (`$to
 `@odata.type` → `odata.type`) in the schema shown to the model, and transparently translates
 arguments back to the real OData names before the request is built — so the model sees clean
 parameter names and Graph still gets what it expects on the wire.
+
+The generated tools' output schemas (the full nested Graph response model, ~18 KB per incident
+tool) are stripped in `server.py`; responses still come back as structured JSON.
 
 Only `security_UpdateIncidents` writes anything. If you wire this into an MCP client with
 allow/ask permission rules (e.g. Claude Code), put the other three in `allow` and this one in
@@ -56,6 +99,26 @@ on Microsoft Graph:
 Grant admin consent, then create a client secret. You'll need the **tenant ID**, **client ID**,
 and **client secret**.
 
+### For the `graph` toolset (e.g. an Entra ID security review)
+
+Use a **separate, read-only app registration** and run it as its own MCP server entry (see
+[below](#a-second-entry-for-the-graph-toolset)), so the broad directory read access doesn't sit
+behind your everyday SOC agent. A reasonable read-only set for reviewing Entra ID configuration:
+
+| Permission                          | Covers                                                                          |
+|-------------------------------------|---------------------------------------------------------------------------------|
+| `Policy.Read.All`                   | Conditional Access, authorization/auth-methods/cross-tenant/security-defaults policies |
+| `Directory.Read.All`                | users, groups, devices, domains, organization                                   |
+| `RoleManagement.Read.Directory`     | directory role definitions, assignments, PIM eligibility/assignment schedules   |
+| `Application.Read.All`              | app registrations, service principals, credentials, app role assignments        |
+| `AuditLog.Read.All`                 | sign-in and directory audit logs                                                |
+| `Reports.Read.All`                  | usage reports                                                                   |
+| `UserAuthenticationMethod.Read.All` | per-user authentication methods, MFA registration details                       |
+| `IdentityRiskyUser.Read.All`        | Identity Protection risky users                                                 |
+
+Each endpoint's docs link (from `graph_describe_operation`) lists the exact permission it needs; a
+403 from `graph_get` usually means one is missing.
+
 ## Setup (for developing/regenerating the spec)
 
 ```bash
@@ -64,10 +127,11 @@ cp .env.example .env   # fill in AZURE_TENANT_ID / AZURE_CLIENT_ID / AZURE_CLIEN
 uv run defender-xdr-mcp
 ```
 
-Regenerating the spec (e.g. after a Microsoft Graph update):
+Regenerating the spec and the `graph` index (e.g. after a Microsoft Graph update):
 
 ```bash
-uv run python scripts/fetch_spec.py
+uv run python scripts/fetch_spec.py                       # downloads the ~40 MB upstream spec
+uv run python scripts/fetch_spec.py --spec openapi.yaml   # or reuse a local copy
 ```
 
 ## Installing it as a standalone command
@@ -112,3 +176,19 @@ your environment at startup, so the secret itself never needs to appear in any f
 Then extend `~/.claude/settings.json`'s `permissions.allow` / `permissions.ask` the same way it's
 already split for the other connected MCP servers: the three read-only tools in `allow`,
 `mcp__defender-xdr__security_UpdateIncidents` in `ask`.
+
+### A second entry for the `graph` toolset
+
+Same binary, different app registration and toolset:
+
+```bash
+claude mcp add --scope user \
+  --env AZURE_TENANT_ID=<your-tenant-id> \
+  --env AZURE_CLIENT_ID=<review-app-client-id> \
+  --env AZURE_CLIENT_SECRET=<review-app-client-secret> \
+  --env GRAPH_MCP_TOOLSETS=graph \
+  graph-review \
+  -- defender-xdr-mcp
+```
+
+All three `graph_*` tools are read-only, so `mcp__graph-review__*` can go in `allow`.
