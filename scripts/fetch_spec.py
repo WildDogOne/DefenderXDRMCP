@@ -1,23 +1,28 @@
-"""Generate src/defender_xdr_mcp/openapi/security.generated.yaml from Microsoft's own Graph v1.0 OpenAPI spec.
+"""Generate src/defender_xdr_mcp/openapi/security.generated.yaml from Microsoft's own Graph beta OpenAPI spec.
 
-Downloads the full (~40+ MB) spec published by Microsoft at
+Downloads the full (~70 MB) beta spec published by Microsoft at
 https://github.com/microsoftgraph/msgraph-metadata and slices out just the operations this
-project exposes as MCP tools: Defender XDR Incidents (list / get / update) and Advanced Hunting
-(runHuntingQuery). Only those operations plus the components (schemas/parameters/responses) they
-actually reference are kept, so the generated spec stays small and self-contained.
+project exposes as `xdr` MCP tools: Defender XDR Incidents (list / get / update), incident tasks,
+Advanced Hunting (runHuntingQuery) and custom detection rules (list / get). Only
+those operations plus the components (schemas/parameters/responses) they actually reference are
+kept, so the generated spec stays small and self-contained. Beta rather than v1.0 because detection
+rules and incident tasks only exist there, and beta's incident model is a
+superset of v1.0's; the server takes its base URL from the generated spec's `servers` entry.
 
 It also writes src/defender_xdr_mcp/openapi/graph_index.json.gz: a compact, searchable index of
 *every* GET operation in the full spec (path, summary, OData options, response type) plus a shallow
 description of every schema type. That index backs the opt-in `graph` toolset
 (graph_search_operations / graph_describe_operation / graph_get), which reaches all of Graph
-without generating one tool per operation.
+without generating one tool per operation. graph_index_beta.json.gz is the same index built from
+the Graph *beta* spec, for endpoints that only exist there (e.g. Defender XDR custom detection
+rules, /security/rules/detectionRules).
 
 Re-run this whenever Microsoft updates the upstream spec (e.g. new incident properties, new
 hunting query options) to regenerate the MCP server's tool set without hand-editing anything.
 
 Usage:
-    uv run python scripts/fetch_spec.py                       # download the upstream spec
-    uv run python scripts/fetch_spec.py --spec openapi.yaml   # use an already-downloaded copy
+    uv run python scripts/fetch_spec.py          # download both upstream specs (~40 + ~70 MB)
+    uv run python scripts/fetch_spec.py --spec v1.yaml --beta-spec beta.yaml   # use local copies
 """
 
 from __future__ import annotations
@@ -34,9 +39,11 @@ from typing import Any
 import yaml
 
 SOURCE_URL = "https://raw.githubusercontent.com/microsoftgraph/msgraph-metadata/master/openapi/v1.0/openapi.yaml"
+BETA_SOURCE_URL = "https://raw.githubusercontent.com/microsoftgraph/msgraph-metadata/master/openapi/beta/openapi.yaml"
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "src" / "defender_xdr_mcp" / "openapi"
 OUTPUT_PATH = OUTPUT_DIR / "security.generated.yaml"
 INDEX_PATH = OUTPUT_DIR / "graph_index.json.gz"
+BETA_INDEX_PATH = OUTPUT_DIR / "graph_index_beta.json.gz"
 
 # Trim long upstream descriptions in the index - enough for an agent to pick the right endpoint or
 # property (Graph puts "Supports $filter (eq, ne, ...)" notes in property descriptions), without
@@ -47,14 +54,20 @@ MAX_PROPERTY_DESCRIPTION = 300
 # Prefer the libyaml-backed loader: it parses the 40+ MB spec in seconds instead of minutes.
 YAML_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
 
-# Paths -> the HTTP methods we keep on each. Everything else on these paths (create/delete/
-# mergeIncidents/$count/etc.) is dropped: it's outside the two capabilities the Defender XDR docs
-# name (https://learn.microsoft.com/en-us/defender-xdr/api-overview) — Incidents and Advanced
-# Hunting — and outside the three documented Incidents methods (List/Get/Update).
+# Paths (in the beta spec) -> the HTTP methods we keep on each. Everything else on these paths
+# (create/delete/$count/etc.) is dropped. Only PATCH on an incident writes anything; detection
+# rules and incident tasks are read-only here even though Graph also offers create/update/delete
+# for them - add the method below (and an `ask` permission rule) if that's ever wanted.
+# getHuntingSchema() is deliberately left out: it returns every table's schema in one ~240 KB
+# response with no filter. `<Table> | getschema` via runHuntingQuery covers the same need per table.
 KEPT_OPERATIONS: dict[str, set[str]] = {
     "/security/incidents": {"get"},
     "/security/incidents/{incident-id}": {"get", "patch"},
+    "/security/incidentTasks": {"get"},
+    "/security/incidentTasks/{incidentTask-id}": {"get"},
     "/security/microsoft.graph.security.runHuntingQuery": {"post"},
+    "/security/rules/detectionRules": {"get"},
+    "/security/rules/detectionRules/{detectionRule-id}": {"get"},
 }
 
 REF_RE = re.compile(r"^#/components/(schemas|parameters|responses|requestBodies|headers)/(.+)$")
@@ -135,17 +148,16 @@ def write_trimmed_spec(spec: dict[str, Any]) -> None:
     output = {
         "openapi": spec["openapi"],
         "info": {
-            "title": "Microsoft Defender XDR (via Graph Security API) - Incidents & Advanced Hunting",
+            "title": "Microsoft Defender XDR (via Graph Security API, beta)",
             "description": (
-                "Trimmed slice of Microsoft's Graph v1.0 OpenAPI spec, generated by "
-                "scripts/fetch_spec.py. Covers only Defender XDR Incidents (list/get/update) and "
-                "Advanced Hunting (runHuntingQuery), per "
-                "https://learn.microsoft.com/en-us/defender-xdr/api-overview. "
+                "Trimmed slice of Microsoft's Graph beta OpenAPI spec, generated by "
+                "scripts/fetch_spec.py. Covers Defender XDR Incidents (list/get/update), incident "
+                "tasks, Advanced Hunting (runHuntingQuery) and custom detection rules (list/get). "
                 "Do not hand-edit - re-run the generator instead."
             ),
             "version": spec["info"]["version"],
         },
-        "servers": [{"url": "https://graph.microsoft.com/v1.0"}],
+        "servers": spec["servers"],
         "paths": filtered_paths,
         "components": kept_components,
     }
@@ -265,7 +277,7 @@ def classify_response(op: dict[str, Any], components: dict[str, Any]) -> tuple[s
     return type_str(schema), False
 
 
-def build_graph_index(spec: dict[str, Any]) -> dict[str, Any]:
+def build_graph_index(spec: dict[str, Any], api_version: str) -> dict[str, Any]:
     components = spec["components"]
     operations = []
     for path, item in spec["paths"].items():
@@ -302,37 +314,45 @@ def build_graph_index(spec: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "graph_version": spec["info"]["version"],
-        "base_url": "https://graph.microsoft.com/v1.0",
+        "base_url": f"https://graph.microsoft.com/{api_version}",
         "operations": operations,
         "types": build_types(components.get("schemas", {})),
     }
 
 
-def write_graph_index(spec: dict[str, Any]) -> None:
-    index = build_graph_index(spec)
+def write_graph_index(spec: dict[str, Any], api_version: str, path: Path) -> None:
+    index = build_graph_index(spec, api_version)
     data = json.dumps(index, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    INDEX_PATH.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
     # mtime=0 keeps the gzip output byte-identical across runs when the spec hasn't changed.
-    with INDEX_PATH.open("wb") as raw, gzip.GzipFile(fileobj=raw, mode="wb", mtime=0) as f:
+    with path.open("wb") as raw, gzip.GzipFile(fileobj=raw, mode="wb", mtime=0) as f:
         f.write(data)
     print(
-        f"Wrote {INDEX_PATH} - {len(index['operations'])} GET operations, "
-        f"{len(index['types'])} types ({INDEX_PATH.stat().st_size / 1e6:.1f} MB gzipped).",
+        f"Wrote {path} - {len(index['operations'])} GET operations, "
+        f"{len(index['types'])} types ({path.stat().st_size / 1e6:.1f} MB gzipped).",
         file=sys.stderr,
     )
 
 
+def load_spec(local: Path | None, url: str) -> dict[str, Any]:
+    raw = local.read_text() if local else download(url)
+    print("Parsing YAML...", file=sys.stderr)
+    return yaml.load(raw, Loader=YAML_LOADER)  # noqa: S506 - CSafeLoader/SafeLoader, both safe
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
-    parser.add_argument("--spec", type=Path, help="use a local copy of the upstream openapi.yaml")
+    parser.add_argument("--spec", type=Path, help="use a local copy of the upstream v1.0 openapi.yaml")
+    parser.add_argument("--beta-spec", type=Path, help="use a local copy of the upstream beta openapi.yaml")
     args = parser.parse_args()
 
-    raw = args.spec.read_text() if args.spec else download(SOURCE_URL)
-    print("Parsing YAML...", file=sys.stderr)
-    spec = yaml.load(raw, Loader=YAML_LOADER)  # noqa: S506 - CSafeLoader/SafeLoader, both safe
+    spec = load_spec(args.spec, SOURCE_URL)
+    write_graph_index(spec, "v1.0", INDEX_PATH)
+    del spec  # the parsed beta spec is large too; don't hold both in memory
 
+    spec = load_spec(args.beta_spec, BETA_SOURCE_URL)
     write_trimmed_spec(spec)
-    write_graph_index(spec)
+    write_graph_index(spec, "beta", BETA_INDEX_PATH)
 
 
 if __name__ == "__main__":

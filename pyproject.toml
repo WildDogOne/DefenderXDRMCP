@@ -1,6 +1,6 @@
 [project]
 name = "defender-xdr-mcp"
-version = "0.2.0"
+version = "0.3.0"
 description = "MCP server for Microsoft Defender XDR (Incidents + Advanced Hunting), generated from Microsoft's own Graph Security API OpenAPI spec"
 readme = "README.md"
 requires-python = ">=3.11"

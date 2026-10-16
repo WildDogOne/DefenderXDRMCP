@@ -1,4 +1,4 @@
-"""The opt-in `graph` toolset: read-only access to *all* of Microsoft Graph v1.0 in three tools.
+"""The opt-in `graph` toolset: read-only access to *all* of Microsoft Graph (v1.0 + beta) in three tools.
 
 This is the one deliberately hand-written part of the server. Generating one MCP tool per Graph
 operation doesn't scale: the full v1.0 spec has ~9,400 GET operations, and each generated tool
@@ -10,12 +10,15 @@ carries its schema into the agent's context. Instead the agent discovers what it
     graph_get("/identity/conditionalAccess/policies", select="displayName,state")
 
 The tools are still driven by Microsoft's own spec: search/describe read
-openapi/graph_index.json.gz, which scripts/fetch_spec.py builds from the same upstream spec as the
-XDR tools. Nothing here describes an endpoint by hand.
+openapi/graph_index.json.gz (v1.0) and graph_index_beta.json.gz (beta), which scripts/fetch_spec.py
+builds from Microsoft's upstream specs. Nothing here describes an endpoint by hand.
 
-graph_get only issues GET requests and only to https://graph.microsoft.com/v1.0. What it can read is
-whatever the app registration's Application permissions allow - that, not this code, is the real
-access boundary (see README "App registration").
+v1.0 is the default everywhere; beta is opt-in per call (`api_version="beta"`) for endpoints that
+only exist there, e.g. Defender XDR custom detection rules. Search marks which versions have a path.
+
+graph_get only issues GET requests and only to https://graph.microsoft.com/{v1.0,beta}. What it
+can read is whatever the app registration's Application permissions allow - that, not this code, is
+the real access boundary (see README "App registration").
 """
 
 from __future__ import annotations
@@ -26,7 +29,7 @@ import os
 import re
 from functools import cache
 from importlib import resources
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from urllib.parse import quote
 
 import httpx2
@@ -35,9 +38,15 @@ from fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
-from .auth import GRAPH_BASE_URL
+from .auth import GRAPH_ROOT
 
-INDEX_RESOURCE = resources.files("defender_xdr_mcp.openapi").joinpath("graph_index.json.gz")
+API_VERSIONS = ("v1.0", "beta")
+ApiVersion = Literal["v1.0", "beta"]
+INDEX_FILES = {"v1.0": "graph_index.json.gz", "beta": "graph_index_beta.json.gz"}
+BETA_NOTE = (
+    "Graph beta: not supported for production use and may change without notice. Prefer v1.0 when"
+    " the endpoint exists there."
+)
 
 # Graph pages can be huge (a /users page with all properties is easily several MB). Anything over
 # this many characters gets trimmed before it reaches the agent's context.
@@ -51,35 +60,37 @@ READ_ONLY = ToolAnnotations(readOnlyHint=True, openWorldHint=True)
 
 
 @cache
-def _index() -> dict[str, Any]:
+def _index(api_version: str) -> dict[str, Any]:
     # Loaded on first use rather than at startup: the XDR-only default never pays for it.
-    with INDEX_RESOURCE.open("rb") as raw, gzip.open(raw) as f:
+    resource = resources.files("defender_xdr_mcp.openapi").joinpath(INDEX_FILES[api_version])
+    with resource.open("rb") as raw, gzip.open(raw) as f:
         return json.load(f)
 
 
 @cache
-def _path_matchers() -> list[tuple[re.Pattern[str], dict[str, Any]]]:
+def _path_matchers(api_version: str) -> list[tuple[re.Pattern[str], dict[str, Any]]]:
     """Regexes that match a concrete path (/users/abc/memberOf) to its template."""
     matchers = []
-    for op in _index()["operations"]:
+    for op in _index(api_version)["operations"]:
         parts = re.split(r"\{[^}]+\}", op["path"])
         pattern = "[^/]+".join(re.escape(part) for part in parts)
         matchers.append((re.compile(f"^{pattern}$", re.IGNORECASE), op))
     return matchers
 
 
-def _normalize_path(path: str) -> str:
+def _split_url(path: str) -> tuple[str | None, str]:
+    """Strip an absolute Graph URL down to (api_version, /path); version is None for bare paths."""
     path = path.strip()
-    if path.lower().startswith(GRAPH_BASE_URL.lower()):
-        path = path[len(GRAPH_BASE_URL) :]
-    path = path.split("?", 1)[0]
-    return "/" + path.strip("/")
+    for version in API_VERSIONS:
+        prefix = f"{GRAPH_ROOT}/{version}"
+        if path.lower().startswith(prefix.lower() + "/") or path.lower() == prefix.lower():
+            return version, "/" + path[len(prefix) :].split("?", 1)[0].strip("/")
+    return None, "/" + path.split("?", 1)[0].strip("/")
 
 
-def _find_operation(path: str) -> dict[str, Any] | None:
-    path = _normalize_path(path)
+def _find_operation(path: str, api_version: str) -> dict[str, Any] | None:
     candidates = []
-    for pattern, op in _path_matchers():
+    for pattern, op in _path_matchers(api_version):
         if op["path"].lower() == path.lower():
             return op
         if pattern.match(path):
@@ -93,9 +104,9 @@ def _returns(op: dict[str, Any]) -> str:
     return f"collection of {response}" if op.get("collection") else response
 
 
-def _flatten_type(name: str) -> tuple[dict[str, list[Any]], list[str]]:
+def _flatten_type(name: str, api_version: str) -> tuple[dict[str, list[Any]], list[str]]:
     """All properties of a type including inherited ones, plus its inheritance chain."""
-    types = _index()["types"]
+    types = _index(api_version)["types"]
     props: dict[str, list[Any]] = {}
     chain: list[str] = []
     current: str | None = name
@@ -107,15 +118,15 @@ def _flatten_type(name: str) -> tuple[dict[str, list[Any]], list[str]]:
     return props, chain
 
 
-def _describe_type(name: str) -> dict[str, Any]:
-    types = _index()["types"]
+def _describe_type(name: str, api_version: str) -> dict[str, Any]:
+    types = _index(api_version)["types"]
     name = name.removeprefix("microsoft.graph.")
     if name not in types:
-        raise ToolError(f"Unknown type {name!r}.")
+        raise ToolError(f"Unknown type {name!r} in Graph {api_version}.")
     if "enum" in types[name]:
         return {"type": name, "enum": types[name]["enum"]}
 
-    props, chain = _flatten_type(name)
+    props, chain = _flatten_type(name, api_version)
     properties: dict[str, str] = {}
     navigation: dict[str, str] = {}
     enums: dict[str, list[str]] = {}
@@ -204,9 +215,10 @@ def register_graph_tools(server: FastMCP, client: httpx2.AsyncClient) -> None:
         ],
         limit: Annotated[int, Field(ge=1, le=100)] = 20,
     ) -> dict[str, Any]:
-        """Search every read (GET) operation in the Microsoft Graph v1.0 API by keyword.
+        """Search every read (GET) operation in Microsoft Graph (v1.0 and beta) by keyword.
 
-        /me paths are excluded: this server authenticates app-only, so use /users/{id} instead.
+        Each match lists the API versions that have it; beta-only paths need api_version="beta"
+        in graph_describe_operation / graph_get. /me paths are excluded: this server authenticates app-only, so use /users/{id} instead.
         Matches against path, summary and description. Use this to find the endpoint for a task,
         then graph_describe_operation for its parameters and properties, then graph_get to call it.
         """
@@ -215,8 +227,16 @@ def register_graph_tools(server: FastMCP, client: httpx2.AsyncClient) -> None:
             raise ToolError("Query must contain at least one keyword.")
 
         want_count = "count" in terms
+        # Most beta paths also exist in v1.0: merge by path, keeping the v1.0 entry's text (it's
+        # the one graph_get uses by default) and recording which versions have it.
+        merged: dict[str, tuple[dict[str, Any], list[str]]] = {}
+        for version in API_VERSIONS:
+            for op in _index(version)["operations"]:
+                entry = merged.setdefault(op["path"].lower(), (op, []))
+                entry[1].append(version)
+
         scored = []
-        for op in _index()["operations"]:
+        for op, versions in merged.values():
             path = op["path"]
             # /me needs a signed-in user, which app-only auth never has; /$count variants just
             # duplicate their list endpoint (whose `count` option does the same) unless asked for.
@@ -226,18 +246,25 @@ def register_graph_tools(server: FastMCP, client: httpx2.AsyncClient) -> None:
             extra = f"{op['description']} {op.get('response') or ''}".lower()
             hits = [2 if t in main else 1 if t in extra else 0 for t in terms]
             if any(hits):
-                scored.append((sum(1 for h in hits if h), sum(hits), op))
+                scored.append((sum(1 for h in hits if h), sum(hits), op, versions))
 
-        # Ops matching every term first, then by score; among equals, shallow literal paths win
-        # over deep navigation chains like /users/{id}/onenote/notebooks/{id}/sections/...
+        # Ops matching every term first, then by score; among equals, v1.0 over beta-only, and
+        # shallow literal paths over deep navigation chains like /users/{id}/onenote/notebooks/...
         scored.sort(
-            key=lambda s: (-s[0], -s[1], s[2]["path"].count("{"), s[2]["path"].count("/"), len(s[2]["path"]))
+            key=lambda s: (
+                -s[0],
+                -s[1],
+                "v1.0" not in s[3],
+                s[2]["path"].count("{"),
+                s[2]["path"].count("/"),
+                len(s[2]["path"]),
+            )
         )
         return {
             "total_matches": len(scored),
             "matches": [
-                {"path": op["path"], "summary": op["summary"], "returns": _returns(op)}
-                for _, _, op in scored[:limit]
+                {"path": op["path"], "summary": op["summary"], "returns": _returns(op), "versions": versions}
+                for _, _, op, versions in scored[:limit]
             ],
             "hint": "graph_describe_operation(path) shows query options and response properties.",
         }
@@ -262,23 +289,35 @@ def register_graph_tools(server: FastMCP, client: httpx2.AsyncClient) -> None:
                 )
             ),
         ] = None,
+        api_version: Annotated[
+            ApiVersion | None,
+            Field(description="Default: v1.0 if the path exists there, else beta."),
+        ] = None,
     ) -> dict[str, Any]:
         """Describe a Graph GET operation (supported OData options, response properties, docs link)
         or a single Graph type. Properties are shallow: nested complex types are named, not
         expanded - pass one as `type_name` to drill in."""
         if type_name:
-            return _describe_type(type_name)
+            in_v1 = type_name.removeprefix("microsoft.graph.") in _index("v1.0")["types"]
+            return _describe_type(type_name, api_version or ("v1.0" if in_v1 else "beta"))
         if not path:
             raise ToolError("Pass either `path` or `type_name`.")
 
-        op = _find_operation(path)
+        url_version, path = _split_url(path)
+        candidates = [api_version or url_version] if (api_version or url_version) else list(API_VERSIONS)
+        op, version = None, candidates[0]
+        for version in candidates:
+            op = _find_operation(path, version)
+            if op is not None:
+                break
         if op is None:
             raise ToolError(
-                f"No GET operation matches {path!r} in Graph v1.0. Use graph_search_operations to"
-                " find the right path (the endpoint may be beta-only, or not readable via GET)."
+                f"No GET operation matches {path!r} in Graph {' or '.join(candidates)}. Use"
+                " graph_search_operations to find the right path."
             )
 
         result: dict[str, Any] = {
+            "api_version": version,
             "path": op["path"],
             "summary": op["summary"],
             "description": op["description"],
@@ -289,15 +328,17 @@ def register_graph_tools(server: FastMCP, client: httpx2.AsyncClient) -> None:
             result["other_parameters"] = op["params"]
         if op.get("docs"):
             result["docs"] = op["docs"] + " (lists required permissions)"
+        if version == "beta":
+            result["note"] = BETA_NOTE
 
         response_type = op.get("response")
-        if response_type in _index()["types"]:
-            result["response_type"] = _describe_type(response_type)
+        if response_type in _index(version)["types"]:
+            result["response_type"] = _describe_type(response_type, version)
 
         prefix = op["path"].rstrip("/") + "/"
         children = sorted(
             o["path"]
-            for o in _index()["operations"]
+            for o in _index(version)["operations"]
             if o["path"].startswith(prefix) and "/" not in o["path"][len(prefix) :].rstrip("/")
         )
         if children:
@@ -310,7 +351,7 @@ def register_graph_tools(server: FastMCP, client: httpx2.AsyncClient) -> None:
             str,
             Field(
                 description=(
-                    "Graph v1.0 path with concrete IDs, e.g. /identity/conditionalAccess/policies or"
+                    "Graph path with concrete IDs, e.g. /identity/conditionalAccess/policies or"
                     " /users/{id}/memberOf. To page, pass a response's @odata.nextLink URL as-is"
                     " (then leave the other arguments empty)."
                 )
@@ -332,8 +373,13 @@ def register_graph_tools(server: FastMCP, client: httpx2.AsyncClient) -> None:
                 )
             ),
         ] = False,
+        api_version: Annotated[
+            ApiVersion,
+            Field(description="Graph API version. Use beta only for paths search lists as beta-only."),
+        ] = "v1.0",
     ) -> dict[str, Any]:
-        """Read-only GET against Microsoft Graph v1.0, using the server's app-only credentials.
+        """Read-only GET against Microsoft Graph (v1.0 by default, or beta), using the server's
+        app-only credentials.
 
         Large pages are trimmed to fit the context; prefer `select` and `top` to keep responses
         small. Results carry @odata.nextLink when more pages exist.
@@ -355,13 +401,16 @@ def register_graph_tools(server: FastMCP, client: httpx2.AsyncClient) -> None:
 
         path = path.strip()
         if "://" in path:
-            # Only absolute URLs on the v1.0 host: the client attaches a Graph bearer token to every
-            # request it sends, so this check is what keeps that token from going anywhere else.
-            if not path.startswith(GRAPH_BASE_URL + "/"):
-                raise ToolError(f"Absolute URLs must start with {GRAPH_BASE_URL}/ (e.g. an @odata.nextLink).")
+            # Only absolute URLs on the Graph host and a known version: the client attaches a Graph
+            # bearer token to every request it sends, so this check is what keeps that token from
+            # going anywhere else.
+            allowed = [f"{GRAPH_ROOT}/{v}/" for v in API_VERSIONS]
+            if not any(path.startswith(prefix) for prefix in allowed):
+                raise ToolError(f"Absolute URLs must start with {' or '.join(allowed)} (e.g. an @odata.nextLink).")
             url = path
         else:
-            url = "/" + path.lstrip("/")
+            # Always absolute: the shared client's base_url is v1.0, which would be wrong for beta.
+            url = f"{GRAPH_ROOT}/{api_version}/" + path.lstrip("/")
         if ".." in url.split("?", 1)[0].split("/"):
             raise ToolError("Path must not contain '..' segments.")
         if "?" in url and query:

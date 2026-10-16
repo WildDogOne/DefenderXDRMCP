@@ -15,7 +15,7 @@ import httpx2
 import msal
 
 GRAPH_SCOPE = "https://graph.microsoft.com/.default"
-GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
+GRAPH_ROOT = "https://graph.microsoft.com"
 
 
 class ClientCredentialsAuth(httpx2.Auth):
@@ -45,8 +45,12 @@ class ClientCredentialsAuth(httpx2.Auth):
         yield request
 
 
-def build_http_client() -> httpx2.AsyncClient:
-    """Build the authenticated httpx client FastMCP will use to actually call Graph."""
+def build_http_client(base_url: str) -> httpx2.AsyncClient:
+    """Build the authenticated httpx client FastMCP will use to actually call Graph.
+
+    base_url is the generated spec's server URL (https://graph.microsoft.com/beta for the xdr
+    tools); the graph toolset always sends absolute URLs, so it doesn't depend on it.
+    """
     try:
         tenant_id = os.environ["AZURE_TENANT_ID"]
         client_id = os.environ["AZURE_CLIENT_ID"]
@@ -59,7 +63,7 @@ def build_http_client() -> httpx2.AsyncClient:
         ) from exc
 
     return httpx2.AsyncClient(
-        base_url=GRAPH_BASE_URL,
+        base_url=base_url,
         auth=ClientCredentialsAuth(tenant_id, client_id, client_secret),
         # Advanced hunting queries can legitimately run for a while; Graph itself times a single
         # request out at 3 minutes (see api-advanced-hunting docs), so stay above that.
