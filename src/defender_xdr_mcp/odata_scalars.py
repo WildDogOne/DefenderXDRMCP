@@ -11,7 +11,10 @@ branch never applies it).
 The fix belongs at the tool boundary, not in the httpx client: rewrite the
 boolean argument to its lowercase string before FastMCP builds the request.
 The generated tool schema declares these parameters as booleans, so the model
-keeps passing ``true``/``false`` - only the wire value changes.
+keeps passing ``true``/``false`` - only the wire value changes. Some MCP clients
+(e.g. opencode) send the value already stringified as ``"True"``/``"False"``,
+which ``str()`` would pass through unchanged, so string forms of booleans on
+boolean-typed parameters are lowercased too.
 
 Register via FastMCP.from_openapi(..., mcp_component_fn=...) alongside
 sanitize_component (see server.py).
@@ -33,13 +36,29 @@ def normalize_odata_scalars(route: Any, component: Any) -> None:
     ):
         return  # no boolean query parameters on this tool (e.g. Get*, path-only operations)
 
+    bool_params = {
+        name
+        for name, prop in schema["properties"].items()
+        if isinstance(prop, dict) and prop.get("type") == "boolean"
+    }
+
     original_run = component.run
 
-    async def run_with_scalar_booleans(arguments: dict[str, Any], _orig=original_run):
-        fixed = {
-            name: str(value).lower() if isinstance(value, bool) else value
-            for name, value in arguments.items()
-        }
+    async def run_with_scalar_booleans(
+        arguments: dict[str, Any], _orig=original_run, _bp=bool_params
+    ):
+        fixed = {}
+        for name, value in arguments.items():
+            if isinstance(value, bool):
+                fixed[name] = str(value).lower()
+            elif (
+                name in _bp
+                and isinstance(value, str)
+                and value.lower() in ("true", "false")
+            ):
+                fixed[name] = value.lower()
+            else:
+                fixed[name] = value
         return await _orig(fixed)
 
     # pydantic models (component's base class) reject setting a non-field attribute, so the

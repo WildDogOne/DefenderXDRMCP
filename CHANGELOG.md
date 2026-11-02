@@ -7,6 +7,14 @@ All notable changes to this project are documented here. The format follows
 Tool names are generated from Microsoft's Graph `operationId`s. A regenerated spec can rename or
 change tools even when this project's code didn't change, so spec regenerations are listed too.
 
+## [0.4.2] - 2026-11-02
+
+### Fixed
+- The `odata_scalars` hook only rewrote real Python booleans, so a client that sends the value
+  already stringified (opencode sends `count: "True"`) still went out as `$count=True` and 400'd.
+  The hook now also lowercases string forms of booleans (`"True"`/`"False"`) on boolean-typed
+  parameters, covering `true`, `"true"` and `"True"` alike.
+
 ## [0.4.1] - 2026-11-02
 
 ### Fixed
@@ -73,7 +81,8 @@ change tools even when this project's code didn't change, so spec regenerations 
 ### Fixed
 - Spec shipped as package data so `uv tool install` works outside the checkout.
 
-[0.4.1]: https://github.com/WildDogOne/DefenderXDRMCP/compare/d945277...HEAD
+[0.4.2]: https://github.com/WildDogOne/DefenderXDRMCP/compare/7345d77...HEAD
+[0.4.1]: https://github.com/WildDogOne/DefenderXDRMCP/compare/d945277...7345d77
 [0.4.0]: https://github.com/WildDogOne/DefenderXDRMCP/compare/aee7dcc...HEAD
 [0.3.0]: https://github.com/WildDogOne/DefenderXDRMCP/compare/86e8598...aee7dcc
 [0.2.0]: https://github.com/WildDogOne/DefenderXDRMCP/compare/4576514...86e8598
