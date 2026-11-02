@@ -7,6 +7,19 @@ All notable changes to this project are documented here. The format follows
 Tool names are generated from Microsoft's Graph `operationId`s. A regenerated spec can rename or
 change tools even when this project's code didn't change, so spec regenerations are listed too.
 
+## [0.4.1] - 2026-11-02
+
+### Fixed
+- `count=true` on the list tools (`security_ListIncidents`, `security_caseManagement_ListCases`,
+  `security_caseManagement_cases_ListTasks`, ...) failed with `BadRequest: 'True' is not a valid
+  count option`: FastMCP passes boolean query parameters to httpx unserialized, so Python's
+  `str(True)` went on the wire as `$count=True` instead of `$count=true`. New
+  `odata_scalars.py` hook (registered in `server.py` next to `sanitize_component`) rewrites
+  boolean tool arguments to their lowercase string form before the request is built.
+  (Note: `$count` is now serialized correctly and works on e.g. `/security/incidents`, but the
+  case-management collections reject it outright - `Query option 'Count' is not allowed` - even
+  though the beta spec advertises the parameter.)
+
 ## [0.4.0] - 2026-11-02
 
 ### Added
@@ -60,6 +73,7 @@ change tools even when this project's code didn't change, so spec regenerations 
 ### Fixed
 - Spec shipped as package data so `uv tool install` works outside the checkout.
 
+[0.4.1]: https://github.com/WildDogOne/DefenderXDRMCP/compare/d945277...HEAD
 [0.4.0]: https://github.com/WildDogOne/DefenderXDRMCP/compare/aee7dcc...HEAD
 [0.3.0]: https://github.com/WildDogOne/DefenderXDRMCP/compare/86e8598...aee7dcc
 [0.2.0]: https://github.com/WildDogOne/DefenderXDRMCP/compare/4576514...86e8598

@@ -33,6 +33,7 @@ from fastmcp.server.providers.openapi.routing import MCPType, RouteMap
 
 from .auth import GRAPH_ROOT, build_http_client
 from .graph_tools import register_graph_tools
+from .odata_scalars import normalize_odata_scalars
 from .schema_sanitize import sanitize_component
 
 SPEC_RESOURCE = resources.files("defender_xdr_mcp.openapi").joinpath("security.generated.yaml")
@@ -67,6 +68,9 @@ def _customize_component(route: Any, component: Any) -> None:
     # Graph's OData property names ($top, @odata.type, ...) contain characters the MCP tool
     # schema validator rejects - see schema_sanitize.py for why and how this is reversible.
     sanitize_component(route, component)
+    # FastMCP serializes boolean query parameters with str() ($count=True), which Graph rejects -
+    # see odata_scalars.py. Order-independent: the two hooks rewrite disjoint argument names.
+    normalize_odata_scalars(route, component)
 
 
 def selected_toolsets() -> tuple[str, ...]:
