@@ -1,11 +1,12 @@
 # Defender XDR MCP
 
-MCP server for Microsoft Defender XDR: **Incidents** (plus incident tasks), **Advanced Hunting**
-and **custom detection rules**, via the Microsoft Graph Security API (beta).
+MCP server for Microsoft Defender XDR: **Incidents** (plus incident tasks), **Advanced Hunting**,
+**custom detection rules** and the new unified **case management** (preview), via the Microsoft
+Graph Security API (beta).
 
 The tool set is **generated, not hand-written**: `scripts/fetch_spec.py` downloads Microsoft's own
 Graph beta OpenAPI spec and trims it to just those operations; `FastMCP.from_openapi()` turns that
-trimmed spec into the eight MCP tools below. When Microsoft changes the underlying API, re-running
+trimmed spec into the nineteen MCP tools below. When Microsoft changes the underlying API, re-running
 the generator picks it up — nothing here needs hand-editing to stay in sync.
 
 Beyond that default, an opt-in **`graph` toolset** gives read-only access to *all* of Microsoft
@@ -19,8 +20,8 @@ The XDR-specific advanced hunting endpoint (`api.security.microsoft.com`) is bei
 API. This project targets Graph's `/security` namespace from the start so it doesn't need a
 rewrite once the legacy host stops working.
 
-The `xdr` tools use Graph **beta**, not v1.0: custom detection rules and incident tasks only exist
-in beta, and beta's incident and hunting models are a superset of v1.0's (e.g. `workspaceId` on
+The `xdr` tools use Graph **beta**, not v1.0: custom detection rules, incident tasks and case
+management only exist in beta, and beta's incident and hunting models are a superset of v1.0's (e.g. `workspaceId` on
 `runHuntingQuery`). Microsoft doesn't formally support beta for production use and may change it,
 so a beta change can occasionally break a tool until the spec is regenerated.
 
@@ -34,7 +35,7 @@ Select toolsets with `GRAPH_MCP_TOOLSETS` (comma-separated). Default: `xdr`.
 
 | Toolset | Tools                                                     | Context cost (tool definitions) |
 |---------|-----------------------------------------------------------|---------------------------------|
-| `xdr`   | the eight generated Defender XDR tools below              | ~26 KB                          |
+| `xdr`   | the nineteen generated Defender XDR tools below           | not yet re-measured (was ~26 KB for the first eight) |
 | `graph` | `graph_search_operations`, `graph_describe_operation`, `graph_get` | ~4 KB, regardless of API size   |
 
 `GRAPH_MCP_TOOLSETS=xdr,graph` enables both; `GRAPH_MCP_TOOLSETS=graph` runs only the generic tools.
@@ -82,6 +83,27 @@ All operations are on `https://graph.microsoft.com/beta`.
 | `security_rules_ListDetectionRules` | `GET /security/rules/detectionRules`      | read-only                                                                                                  |
 | `security_rules_GetDetectionRules`  | `GET /security/rules/detectionRules/{id}` | read-only                                                                                                  |
 
+Case management (preview), all under `/security/caseManagement`:
+
+| Tool                                                 | Graph operation                    | Type                                                                                     |
+|------------------------------------------------------|------------------------------------|------------------------------------------------------------------------------------------|
+| `security_caseManagement_ListCases`                  | `GET /cases`                       | read-only (max `top` 100; filter on derived props like `incidentId` isn't supported here) |
+| `security_caseManagement_GetCases`                   | `GET /cases/{id}`                  | read-only (`expand` activities, tasks, relations, attachments)                           |
+| `security_caseManagement_UpdateCases`                | `PATCH /cases/{id}`                | **mutates**: status, assignee, priority, custom fields, ...                              |
+| `security_caseManagement_cases_ListActivities`       | `GET /cases/{id}/activities`       | read-only (comments and audit log)                                                       |
+| `security_caseManagement_cases_CreateActivities`     | `POST /cases/{id}/activities`      | **mutates**: adds a comment (`odata.type` `#microsoft.graph.security.caseManagement.comment`, `message`) |
+| `security_caseManagement_cases_ListTasks`            | `GET /cases/{id}/tasks`            | read-only                                                                                |
+| `security_caseManagement_cases_CreateTasks`          | `POST /cases/{id}/tasks`           | **mutates**: creates a case task                                                         |
+| `security_caseManagement_cases_UpdateTasks`          | `PATCH /cases/{id}/tasks/{taskId}` | **mutates**: updates a case task                                                         |
+| `security_caseManagement_cases_ListRelations`        | `GET /cases/{id}/relations`        | read-only (links to related security resources)                                          |
+| `security_caseManagement_cases_ListAttachments`      | `GET /cases/{id}/attachments`      | read-only (metadata only, no content download)                                           |
+| `security_caseManagement_ListCaseTypeConfigurations` | `GET /caseTypeConfigurations`      | read-only; `expand=statuses,customFields` gives the valid status names and custom fields that updates need |
+
+Every Defender incident also shows up as an `incidentCase` (with `incidentId`); `genericCase` is
+the manually created kind. Status values are tenant-defined, so look them up via
+`ListCaseTypeConfigurations` before updating. Creating or deleting cases, and relation or
+attachment writes, aren't generated.
+
 Graph also has create/update/delete for detection rules and incident tasks; they're deliberately
 not generated (add them to `KEPT_OPERATIONS` if you want them). `getHuntingSchema()` is left out
 too: it returns every table's schema in one ~240 KB response. Use `<Table> | getschema` through
@@ -98,9 +120,12 @@ parameter names and Graph still gets what it expects on the wire.
 The generated tools' output schemas (the full nested Graph response model, ~18 KB per incident
 tool) are stripped in `server.py`; responses still come back as structured JSON.
 
-Only `security_UpdateIncidents` writes anything. If you wire this into an MCP client with
-allow/ask permission rules (e.g. Claude Code), put the other seven in `allow` and this one in
-`ask` — see `src/defender_xdr_mcp/server.py` for the route-map that makes this split explicit.
+Five tools write to the tenant: `security_UpdateIncidents`, `security_caseManagement_UpdateCases`,
+`security_caseManagement_cases_CreateActivities`, `security_caseManagement_cases_CreateTasks` and
+`security_caseManagement_cases_UpdateTasks`, i.e. every PATCH and every POST except
+`security_runHuntingQuery`. If you wire this into an MCP client with allow/ask permission rules
+(e.g. Claude Code), put those five in `ask` and the other fourteen in `allow`. See
+`src/defender_xdr_mcp/server.py` for the route map.
 
 ## App registration
 
@@ -113,6 +138,8 @@ on Microsoft Graph:
 | `SecurityIncident.ReadWrite.All` | update incidents (skip this if you only want read access — drop `security_UpdateIncidents` from your MCP client's tool allow-list too) |
 | `ThreatHunting.Read.All`         | `runHuntingQuery`                                                                                                                      |
 | `CustomDetection.Read.All`       | list/get custom detection rules                                                                                                        |
+| `CaseManagement.Read.All`        | read cases, activities, tasks, relations, attachments, case type configurations                                                         |
+| `CaseManagement.ReadWrite.All`   | update cases, add comments, create/update case tasks (skip it for read-only and keep those four tools out of the allow-list)            |
 
 Incident tasks are covered by the incident permissions above.
 
@@ -194,8 +221,12 @@ with `"env": {"AZURE_TENANT_ID": "${AZURE_TENANT_ID}", ...}` — Claude Code exp
 your environment at startup, so the secret itself never needs to appear in any file or command.
 
 Then extend `~/.claude/settings.json`'s `permissions.allow` / `permissions.ask` the same way it's
-already split for the other connected MCP servers: the seven read-only tools in `allow`,
-`mcp__defender-xdr__security_UpdateIncidents` in `ask`.
+already split for the other connected MCP servers: the fourteen read-only tools in `allow`, the
+five writing tools (`mcp__defender-xdr__security_UpdateIncidents`,
+`mcp__defender-xdr__security_caseManagement_UpdateCases`,
+`mcp__defender-xdr__security_caseManagement_cases_CreateActivities`,
+`mcp__defender-xdr__security_caseManagement_cases_CreateTasks`,
+`mcp__defender-xdr__security_caseManagement_cases_UpdateTasks`) in `ask`.
 
 ### A second entry for the `graph` toolset
 

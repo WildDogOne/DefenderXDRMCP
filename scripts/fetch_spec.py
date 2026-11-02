@@ -3,7 +3,8 @@
 Downloads the full (~70 MB) beta spec published by Microsoft at
 https://github.com/microsoftgraph/msgraph-metadata and slices out just the operations this
 project exposes as `xdr` MCP tools: Defender XDR Incidents (list / get / update), incident tasks,
-Advanced Hunting (runHuntingQuery) and custom detection rules (list / get). Only
+Advanced Hunting (runHuntingQuery), custom detection rules (list / get) and case management
+cases (read / update, comments, tasks). Only
 those operations plus the components (schemas/parameters/responses) they actually reference are
 kept, so the generated spec stays small and self-contained. Beta rather than v1.0 because detection
 rules and incident tasks only exist there, and beta's incident model is a
@@ -55,9 +56,10 @@ MAX_PROPERTY_DESCRIPTION = 300
 YAML_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
 
 # Paths (in the beta spec) -> the HTTP methods we keep on each. Everything else on these paths
-# (create/delete/$count/etc.) is dropped. Only PATCH on an incident writes anything; detection
-# rules and incident tasks are read-only here even though Graph also offers create/update/delete
-# for them - add the method below (and an `ask` permission rule) if that's ever wanted.
+# (create/delete/$count/etc.) is dropped. Every PATCH writes to the tenant, and so does every POST
+# except runHuntingQuery (case comments and case tasks). Detection rules and incident tasks are
+# read-only here even though Graph also offers create/update/delete for them - add the method
+# below (and an `ask` permission rule) if that's ever wanted.
 # getHuntingSchema() is deliberately left out: it returns every table's schema in one ~240 KB
 # response with no filter. `<Table> | getschema` via runHuntingQuery covers the same need per table.
 KEPT_OPERATIONS: dict[str, set[str]] = {
@@ -68,6 +70,18 @@ KEPT_OPERATIONS: dict[str, set[str]] = {
     "/security/microsoft.graph.security.runHuntingQuery": {"post"},
     "/security/rules/detectionRules": {"get"},
     "/security/rules/detectionRules/{detectionRule-id}": {"get"},
+    # Unified case management (preview). Cases are read + updated (status, assignee, priority,
+    # custom fields); comments are added as activities; tasks are listed, created and updated.
+    # Creating/deleting cases, relation and attachment writes are left out. caseTypeConfigurations
+    # is read-only upstream and gives the valid status names and custom fields that writes need.
+    "/security/caseManagement/cases": {"get"},
+    "/security/caseManagement/cases/{case-id}": {"get", "patch"},
+    "/security/caseManagement/cases/{case-id}/activities": {"get", "post"},
+    "/security/caseManagement/cases/{case-id}/tasks": {"get", "post"},
+    "/security/caseManagement/cases/{case-id}/tasks/{task-id}": {"patch"},
+    "/security/caseManagement/cases/{case-id}/relations": {"get"},
+    "/security/caseManagement/cases/{case-id}/attachments": {"get"},
+    "/security/caseManagement/caseTypeConfigurations": {"get"},
 }
 
 REF_RE = re.compile(r"^#/components/(schemas|parameters|responses|requestBodies|headers)/(.+)$")
@@ -93,6 +107,37 @@ def find_refs(node: Any) -> set[tuple[str, str]]:
     elif isinstance(node, list):
         for item in node:
             found |= find_refs(item)
+    return found
+
+
+def body_subtype_refs(
+    paths: dict[str, Any], all_components: dict[str, dict[str, Any]]
+) -> set[tuple[str, str]]:
+    """Discriminator subtypes of each kept operation's request-body schema.
+
+    Polymorphic bodies (e.g. a case-management case or activity) only name their concrete types in
+    `discriminator.mapping`, as plain strings that find_refs doesn't follow. FastMCP merges those
+    subtypes' fields into the tool's input schema, but only if the subtype schemas are present, and
+    that's how fields like a comment's `message` or a generic case's `assignedTo` become arguments.
+    Only the body schema's own mapping is followed: following every mapping would drag in most of
+    Graph (microsoft.graph.entity maps to ~2,400 types), and FastMCP doesn't flatten deeper ones.
+    """
+    found: set[tuple[str, str]] = set()
+    for path_item in paths.values():
+        for method, op in path_item.items():
+            if method not in ("post", "patch", "put") or not isinstance(op, dict):
+                continue
+            for media in op.get("requestBody", {}).get("content", {}).values():
+                m = REF_RE.match(media.get("schema", {}).get("$ref", ""))
+                if not m or m.group(1) != "schemas":
+                    continue
+                schema = all_components["schemas"].get(m.group(2), {})
+                for part in [schema, *schema.get("allOf", [])]:
+                    mapping = (part.get("discriminator") or {}).get("mapping", {})
+                    for target in mapping.values():
+                        t = REF_RE.match(target)
+                        if t:
+                            found.add((t.group(1), t.group(2)))
     return found
 
 
@@ -142,7 +187,7 @@ def write_trimmed_spec(spec: dict[str, Any]) -> None:
 
     # error response is referenced via 4XX/5XX on every kept operation but uses a non-standard
     # key ("error") that find_refs already picks up like any other $ref target.
-    initial_refs = find_refs(filtered_paths)
+    initial_refs = find_refs(filtered_paths) | body_subtype_refs(filtered_paths, spec["components"])
     kept_components = close_over_components(initial_refs, spec["components"])
 
     output = {
@@ -152,7 +197,8 @@ def write_trimmed_spec(spec: dict[str, Any]) -> None:
             "description": (
                 "Trimmed slice of Microsoft's Graph beta OpenAPI spec, generated by "
                 "scripts/fetch_spec.py. Covers Defender XDR Incidents (list/get/update), incident "
-                "tasks, Advanced Hunting (runHuntingQuery) and custom detection rules (list/get). "
+                "tasks, Advanced Hunting (runHuntingQuery), custom detection rules (list/get) and "
+                "case management (cases read/update, comments, tasks). "
                 "Do not hand-edit - re-run the generator instead."
             ),
             "version": spec["info"]["version"],
