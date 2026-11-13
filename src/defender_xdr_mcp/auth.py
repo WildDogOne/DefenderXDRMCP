@@ -45,11 +45,14 @@ class ClientCredentialsAuth(httpx2.Auth):
         yield request
 
 
-def build_http_client(base_url: str) -> httpx2.AsyncClient:
-    """Build the authenticated httpx client FastMCP will use to actually call Graph.
+def build_auth() -> ClientCredentialsAuth:
+    """Build the MSAL-backed auth once, for reuse across every httpx client.
 
-    base_url is the generated spec's server URL (https://graph.microsoft.com/beta for the xdr
-    tools); the graph toolset always sends absolute URLs, so it doesn't depend on it.
+    Each ClientCredentialsAuth owns its own ConfidentialClientApplication and therefore its own
+    MSAL token cache. server.py needs one httpx client per Graph API version (each generated spec
+    has its own `servers` entry) plus one for the graph toolset, so sharing a single auth keeps
+    that to one token acquisition instead of one per client. The Auth object is stateless apart
+    from the cache, so handing it to several AsyncClients is safe.
     """
     try:
         tenant_id = os.environ["AZURE_TENANT_ID"]
@@ -62,9 +65,20 @@ def build_http_client(base_url: str) -> httpx2.AsyncClient:
             "tenant ID, client ID, and client secret."
         ) from exc
 
+    return ClientCredentialsAuth(tenant_id, client_id, client_secret)
+
+
+def build_http_client(base_url: str, auth: ClientCredentialsAuth | None = None) -> httpx2.AsyncClient:
+    """Build the authenticated httpx client FastMCP will use to actually call Graph.
+
+    base_url is the generated spec's server URL - https://graph.microsoft.com/v1.0 for the v1.0
+    xdr tools and https://graph.microsoft.com/beta for the beta ones; the graph toolset always
+    sends absolute URLs, so it doesn't depend on it. Pass the shared auth from build_auth() so
+    the clients don't each acquire their own token.
+    """
     return httpx2.AsyncClient(
         base_url=base_url,
-        auth=ClientCredentialsAuth(tenant_id, client_id, client_secret),
+        auth=auth if auth is not None else build_auth(),
         # Advanced hunting queries can legitimately run for a while; Graph itself times a single
         # request out at 3 minutes (see api-advanced-hunting docs), so stay above that.
         timeout=200.0,

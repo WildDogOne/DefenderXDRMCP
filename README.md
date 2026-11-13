@@ -2,12 +2,15 @@
 
 MCP server for Microsoft Defender XDR: **Incidents** (plus incident tasks), **Advanced Hunting**,
 **custom detection rules** and the new unified **case management** (preview), via the Microsoft
-Graph Security API (beta).
+Graph Security API — on **v1.0** where the operation exists there, **beta** only for what v1.0
+lacks (incident tasks, case management). Never the legacy `api.security.microsoft.com` XDR host,
+which is being retired.
 
 The tool set is **generated, not hand-written**: `scripts/fetch_spec.py` downloads Microsoft's own
-Graph beta OpenAPI spec and trims it to just those operations; `FastMCP.from_openapi()` turns that
-trimmed spec into the nineteen MCP tools below. When Microsoft changes the underlying API, re-running
-the generator picks it up — nothing here needs hand-editing to stay in sync.
+Graph v1.0 and beta OpenAPI specs and trims them to just those operations; `server.py` mounts one
+FastMCP OpenAPI provider per version so each tool hits the right base URL, giving the twenty MCP
+tools below. When Microsoft changes the underlying API, re-running the generator picks it up —
+nothing here needs hand-editing to stay in sync.
 
 Beyond that default, an opt-in **`graph` toolset** gives read-only access to *all* of Microsoft
 Graph, v1.0 and beta (e.g. for an Entra ID configuration review) through three discovery tools, without
@@ -35,7 +38,7 @@ Select toolsets with `GRAPH_MCP_TOOLSETS` (comma-separated). Default: `xdr`.
 
 | Toolset | Tools                                                     | Context cost (tool definitions) |
 |---------|-----------------------------------------------------------|---------------------------------|
-| `xdr`   | the nineteen generated Defender XDR tools below           | not yet re-measured (was ~26 KB for the first eight) |
+| `xdr`   | the twenty generated Defender XDR tools below           | not yet re-measured (was ~26 KB for the first eight) |
 | `graph` | `graph_search_operations`, `graph_describe_operation`, `graph_get` | ~4 KB, regardless of API size   |
 
 `GRAPH_MCP_TOOLSETS=xdr,graph` enables both; `GRAPH_MCP_TOOLSETS=graph` runs only the generic tools.
@@ -70,13 +73,16 @@ see [App registration](#app-registration).
 
 ## Tools (`xdr` toolset)
 
-All operations are on `https://graph.microsoft.com/beta`.
+Incidents, Advanced Hunting and detection rules run on `https://graph.microsoft.com/v1.0`;
+incident tasks and case management run on `https://graph.microsoft.com/beta` (they don't exist in
+v1.0). The version is baked into each generated spec, so the tool table needs no per-row marker.
 
 | Tool                                | Graph operation                           | Type                                                                                                       |
 |-------------------------------------|-------------------------------------------|------------------------------------------------------------------------------------------------------------|
 | `security_ListIncidents`            | `GET /security/incidents`                 | read-only                                                                                                  |
 | `security_GetIncidents`             | `GET /security/incidents/{id}`            | read-only                                                                                                  |
 | `security_UpdateIncidents`          | `PATCH /security/incidents/{id}`          | **mutates** the tenant's incident (status, classification, assignment, etc.)                               |
+| `security_CreateIncidentComments`   | `POST /security/incidents/{id}/comments`  | **mutates**: adds an incident comment (append-only; not in Microsoft's spec, injected by the generator)     |
 | `security_ListIncidentTasks`        | `GET /security/incidentTasks`             | read-only                                                                                                  |
 | `security_GetIncidentTasks`         | `GET /security/incidentTasks/{id}`        | read-only                                                                                                  |
 | `security_runHuntingQuery`          | `POST /security/runHuntingQuery`          | runs a KQL query against Defender's event tables (read-only against tenant data, but modeled as an action) |
@@ -105,7 +111,8 @@ the manually created kind. Status values are tenant-defined, so look them up via
 attachment writes, aren't generated.
 
 Graph also has create/update/delete for detection rules and incident tasks; they're deliberately
-not generated (add them to `KEPT_OPERATIONS` if you want them). `getHuntingSchema()` is left out
+not generated (add them to `KEPT_OPERATIONS_V1` / `KEPT_OPERATIONS_BETA` in the generator if you
+want them). `getHuntingSchema()` is left out
 too: it returns every table's schema in one ~240 KB response. Use `<Table> | getschema` through
 `security_runHuntingQuery` instead, one table at a time.
 
@@ -120,11 +127,12 @@ parameter names and Graph still gets what it expects on the wire.
 The generated tools' output schemas (the full nested Graph response model, ~18 KB per incident
 tool) are stripped in `server.py`; responses still come back as structured JSON.
 
-Five tools write to the tenant: `security_UpdateIncidents`, `security_caseManagement_UpdateCases`,
-`security_caseManagement_cases_CreateActivities`, `security_caseManagement_cases_CreateTasks` and
-`security_caseManagement_cases_UpdateTasks`, i.e. every PATCH and every POST except
-`security_runHuntingQuery`. If you wire this into an MCP client with allow/ask permission rules
-(e.g. Claude Code), put those five in `ask` and the other fourteen in `allow`. See
+Six tools write to the tenant: `security_UpdateIncidents`, `security_CreateIncidentComments`,
+`security_caseManagement_UpdateCases`, `security_caseManagement_cases_CreateActivities`,
+`security_caseManagement_cases_CreateTasks` and `security_caseManagement_cases_UpdateTasks`, i.e.
+every PATCH and every POST except `security_runHuntingQuery`. If you wire this into an MCP client
+with allow/ask permission rules (e.g. Claude Code), put those six in `ask` and the other fourteen
+in `allow`. See
 `src/defender_xdr_mcp/server.py` for the route map.
 
 ## App registration
@@ -135,7 +143,7 @@ on Microsoft Graph:
 | Permission                       | Needed for                                                                                                                             |
 |----------------------------------|----------------------------------------------------------------------------------------------------------------------------------------|
 | `SecurityIncident.Read.All`      | list/get incidents                                                                                                                     |
-| `SecurityIncident.ReadWrite.All` | update incidents (skip this if you only want read access — drop `security_UpdateIncidents` from your MCP client's tool allow-list too) |
+| `SecurityIncident.ReadWrite.All` | update incidents and add incident comments (skip this if you only want read access — drop `security_UpdateIncidents` and `security_CreateIncidentComments` from your MCP client's tool allow-list too) |
 | `ThreatHunting.Read.All`         | `runHuntingQuery`                                                                                                                      |
 | `CustomDetection.Read.All`       | list/get custom detection rules                                                                                                        |
 | `CaseManagement.Read.All`        | read cases, activities, tasks, relations, attachments, case type configurations                                                         |
@@ -183,7 +191,8 @@ uv run python scripts/fetch_spec.py --spec openapi.yaml   # or reuse a local cop
 
 ## Installing it as a standalone command
 
-The generated `openapi/security.generated.yaml` ships as package data (under
+The generated `openapi/security_v1.generated.yaml` and `openapi/security_beta.generated.yaml`
+ship as package data (under
 `src/defender_xdr_mcp/openapi/`), loaded via `importlib.resources` rather than a path relative to
 the repo checkout — so, unlike a plain `uv run --directory /path/to/repo`, the installed command
 below has no dependency on this directory still existing or being readable by whatever spawns it:
@@ -222,7 +231,8 @@ your environment at startup, so the secret itself never needs to appear in any f
 
 Then extend `~/.claude/settings.json`'s `permissions.allow` / `permissions.ask` the same way it's
 already split for the other connected MCP servers: the fourteen read-only tools in `allow`, the
-five writing tools (`mcp__defender-xdr__security_UpdateIncidents`,
+six writing tools (`mcp__defender-xdr__security_UpdateIncidents`,
+`mcp__defender-xdr__security_CreateIncidentComments`,
 `mcp__defender-xdr__security_caseManagement_UpdateCases`,
 `mcp__defender-xdr__security_caseManagement_cases_CreateActivities`,
 `mcp__defender-xdr__security_caseManagement_cases_CreateTasks`,

@@ -16,7 +16,7 @@ keeps passing ``true``/``false`` - only the wire value changes. Some MCP clients
 which ``str()`` would pass through unchanged, so string forms of booleans on
 boolean-typed parameters are lowercased too.
 
-Register via FastMCP.from_openapi(..., mcp_component_fn=...) alongside
+Register via OpenAPIProvider(..., mcp_component_fn=...) alongside
 sanitize_component (see server.py).
 """
 

@@ -1,14 +1,20 @@
-"""Generate src/defender_xdr_mcp/openapi/security.generated.yaml from Microsoft's own Graph beta OpenAPI spec.
+"""Generate the xdr OpenAPI specs from Microsoft's own Graph v1.0 and beta specs.
 
-Downloads the full (~70 MB) beta spec published by Microsoft at
-https://github.com/microsoftgraph/msgraph-metadata and slices out just the operations this
-project exposes as `xdr` MCP tools: Defender XDR Incidents (list / get / update), incident tasks,
-Advanced Hunting (runHuntingQuery), custom detection rules (list / get) and case management
-cases (read / update, comments, tasks). Only
-those operations plus the components (schemas/parameters/responses) they actually reference are
-kept, so the generated spec stays small and self-contained. Beta rather than v1.0 because detection
-rules and incident tasks only exist there, and beta's incident model is a
-superset of v1.0's; the server takes its base URL from the generated spec's `servers` entry.
+Downloads the full upstream v1.0 (~45 MB) and beta (~70 MB) specs published by Microsoft at
+https://github.com/microsoftgraph/msgraph-metadata and slices out just the operations this project
+exposes as `xdr` MCP tools, split across two generated specs by API version:
+
+  - security_v1.generated.yaml   - Graph **v1.0**: Defender XDR Incidents (list / get / update),
+    Advanced Hunting (runHuntingQuery), custom detection rules (list / get).
+  - security_beta.generated.yaml - Graph **beta**: incident tasks, and case management cases
+    (read / update, comments, tasks).
+
+The rule is: use **v1.0** wherever the operation exists there (stable, production-supported), and
+**beta** only for operations that do not (incident tasks, case management). Never the legacy
+`api.security.microsoft.com` XDR host, which is being retired. Each generated spec carries its own
+`servers` entry, and server.py mounts one FastMCP OpenAPI provider per version so each tool hits
+the right base URL. Only the kept operations plus the components (schemas/parameters/responses)
+they actually reference are kept, so each spec stays small and self-contained.
 
 It also writes src/defender_xdr_mcp/openapi/graph_index.json.gz: a compact, searchable index of
 *every* GET operation in the full spec (path, summary, OData options, response type) plus a shallow
@@ -42,7 +48,8 @@ import yaml
 SOURCE_URL = "https://raw.githubusercontent.com/microsoftgraph/msgraph-metadata/master/openapi/v1.0/openapi.yaml"
 BETA_SOURCE_URL = "https://raw.githubusercontent.com/microsoftgraph/msgraph-metadata/master/openapi/beta/openapi.yaml"
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "src" / "defender_xdr_mcp" / "openapi"
-OUTPUT_PATH = OUTPUT_DIR / "security.generated.yaml"
+OUTPUT_V1_PATH = OUTPUT_DIR / "security_v1.generated.yaml"
+OUTPUT_BETA_PATH = OUTPUT_DIR / "security_beta.generated.yaml"
 INDEX_PATH = OUTPUT_DIR / "graph_index.json.gz"
 BETA_INDEX_PATH = OUTPUT_DIR / "graph_index_beta.json.gz"
 
@@ -55,25 +62,31 @@ MAX_PROPERTY_DESCRIPTION = 300
 # Prefer the libyaml-backed loader: it parses the 40+ MB spec in seconds instead of minutes.
 YAML_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
 
-# Paths (in the beta spec) -> the HTTP methods we keep on each. Everything else on these paths
+# Kept operations per API version. The rule: v1.0 wherever the operation exists there (stable,
+# production-supported), beta only for what v1.0 lacks. Never the legacy api.security.microsoft.com
+# host. Paths -> the HTTP methods we keep on each; everything else on those paths
 # (create/delete/$count/etc.) is dropped. Every PATCH writes to the tenant, and so does every POST
 # except runHuntingQuery (case comments and case tasks). Detection rules and incident tasks are
 # read-only here even though Graph also offers create/update/delete for them - add the method
 # below (and an `ask` permission rule) if that's ever wanted.
 # getHuntingSchema() is deliberately left out: it returns every table's schema in one ~240 KB
 # response with no filter. `<Table> | getschema` via runHuntingQuery covers the same need per table.
-KEPT_OPERATIONS: dict[str, set[str]] = {
+KEPT_OPERATIONS_V1: dict[str, set[str]] = {
     "/security/incidents": {"get"},
     "/security/incidents/{incident-id}": {"get", "patch"},
-    "/security/incidentTasks": {"get"},
-    "/security/incidentTasks/{incidentTask-id}": {"get"},
     "/security/microsoft.graph.security.runHuntingQuery": {"post"},
     "/security/rules/detectionRules": {"get"},
     "/security/rules/detectionRules/{detectionRule-id}": {"get"},
-    # Unified case management (preview). Cases are read + updated (status, assignee, priority,
-    # custom fields); comments are added as activities; tasks are listed, created and updated.
-    # Creating/deleting cases, relation and attachment writes are left out. caseTypeConfigurations
-    # is read-only upstream and gives the valid status names and custom fields that writes need.
+}
+KEPT_OPERATIONS_BETA: dict[str, set[str]] = {
+    # Incident tasks exist only in beta.
+    "/security/incidentTasks": {"get"},
+    "/security/incidentTasks/{incidentTask-id}": {"get"},
+    # Unified case management (preview) is beta-only. Cases are read + updated (status, assignee,
+    # priority, custom fields); comments are added as activities; tasks are listed, created and
+    # updated. Creating/deleting cases, relation and attachment writes are left out.
+    # caseTypeConfigurations is read-only upstream and gives the valid status names and custom
+    # fields that writes need.
     "/security/caseManagement/cases": {"get"},
     "/security/caseManagement/cases/{case-id}": {"get", "patch"},
     "/security/caseManagement/cases/{case-id}/activities": {"get", "post"},
@@ -82,6 +95,92 @@ KEPT_OPERATIONS: dict[str, set[str]] = {
     "/security/caseManagement/cases/{case-id}/relations": {"get"},
     "/security/caseManagement/cases/{case-id}/attachments": {"get"},
     "/security/caseManagement/caseTypeConfigurations": {"get"},
+}
+
+# Real Graph endpoints that Microsoft's own OpenAPI spec omits, so there is nothing for the trimmer
+# above to keep. Each entry is a hand-authored path-item fragment merged into the version's spec
+# before component closure, then it flows through the normal pipeline (provider, OData sanitize,
+# POST routing, auth) like any generated operation. `find_refs` still follows the `$ref`s inside, so
+# referenced components (alertComment, the error response) are pulled in automatically.
+#   - Incident comments: `POST /security/incidents/{id}/comments` is live and documented
+#     (https://learn.microsoft.com/graph/api/security-incident-post-comments) but the spec only
+#     lists the *alert*-level SetComments, not this incident-level action. Comments are append-only:
+#     Graph rejects PATCH/DELETE on an individual incident comment. The `@odata.type` discriminator
+#     is optional on the wire (the action accepts a bare `comment`), so it is advertised with a
+#     default rather than required - sending it must use `#microsoft.graph.security.alertComment`.
+SUPPLEMENTAL_OPERATIONS_V1: dict[str, dict[str, Any]] = {
+    "/security/incidents/{incident-id}/comments": {
+        "post": {
+            "tags": ["security.incident"],
+            "summary": "Create comment for incident",
+            "description": (
+                "Add a comment to an incident. Incident comments are append-only - an existing "
+                "comment cannot be edited or deleted. The @odata.type discriminator is optional; if "
+                "supplied it must be '#microsoft.graph.security.alertComment'."
+            ),
+            "externalDocs": {
+                "description": "Find more info here",
+                "url": "https://learn.microsoft.com/graph/api/security-incident-post-comments?view=graph-rest-1.0",
+            },
+            "operationId": "security.CreateIncidentComments",
+            "requestBody": {
+                "description": "New comment.",
+                "required": True,
+                "content": {
+                    "application/json": {
+                        "schema": {
+                            "title": "incidentComment",
+                            "type": "object",
+                            "properties": {
+                                "comment": {"type": "string", "description": "The comment text."},
+                                "@odata.type": {
+                                    "type": "string",
+                                    "default": "#microsoft.graph.security.alertComment",
+                                    "description": (
+                                        "Type discriminator. Optional; if set it must be "
+                                        "'#microsoft.graph.security.alertComment'."
+                                    ),
+                                },
+                            },
+                        }
+                    }
+                },
+            },
+            "responses": {
+                "2XX": {
+                    "description": "The incident's comments after the new one was added.",
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "value": {
+                                        "type": "array",
+                                        "items": {
+                                            "$ref": "#/components/schemas/microsoft.graph.security.alertComment"
+                                        },
+                                    }
+                                },
+                            }
+                        }
+                    },
+                },
+                "4XX": {"$ref": "#/components/responses/error"},
+                "5XX": {"$ref": "#/components/responses/error"},
+            },
+            "x-ms-docs-operation-type": "action",
+        },
+        "parameters": [
+            {
+                "name": "incident-id",
+                "in": "path",
+                "description": "The unique identifier of incident",
+                "required": True,
+                "schema": {"type": "string"},
+                "x-ms-docs-key-type": "incident",
+            }
+        ],
+    }
 }
 
 REF_RE = re.compile(r"^#/components/(schemas|parameters|responses|requestBodies|headers)/(.+)$")
@@ -168,9 +267,16 @@ def close_over_components(
     return {category: dict(sorted(kept[category].items())) for category in sorted(kept)}
 
 
-def write_trimmed_spec(spec: dict[str, Any]) -> None:
+def write_trimmed_spec(
+    spec: dict[str, Any],
+    kept_operations: dict[str, set[str]],
+    out_path: Path,
+    title: str,
+    description: str,
+    supplemental: dict[str, dict[str, Any]] | None = None,
+) -> None:
     filtered_paths: dict[str, Any] = {}
-    for path, methods in KEPT_OPERATIONS.items():
+    for path, methods in kept_operations.items():
         full_path_item = spec["paths"].get(path)
         if full_path_item is None:
             raise SystemExit(f"Path {path!r} not found in upstream spec - has Microsoft renamed it?")
@@ -185,6 +291,11 @@ def write_trimmed_spec(spec: dict[str, Any]) -> None:
                 path_item[key] = value
         filtered_paths[path] = path_item
 
+    # Real endpoints Microsoft's spec omits, injected as hand-authored fragments (see
+    # SUPPLEMENTAL_OPERATIONS_*). Merged before component closure so their $refs resolve normally.
+    for path, fragment in (supplemental or {}).items():
+        filtered_paths[path] = fragment
+
     # error response is referenced via 4XX/5XX on every kept operation but uses a non-standard
     # key ("error") that find_refs already picks up like any other $ref target.
     initial_refs = find_refs(filtered_paths) | body_subtype_refs(filtered_paths, spec["components"])
@@ -192,31 +303,21 @@ def write_trimmed_spec(spec: dict[str, Any]) -> None:
 
     output = {
         "openapi": spec["openapi"],
-        "info": {
-            "title": "Microsoft Defender XDR (via Graph Security API, beta)",
-            "description": (
-                "Trimmed slice of Microsoft's Graph beta OpenAPI spec, generated by "
-                "scripts/fetch_spec.py. Covers Defender XDR Incidents (list/get/update), incident "
-                "tasks, Advanced Hunting (runHuntingQuery), custom detection rules (list/get) and "
-                "case management (cases read/update, comments, tasks). "
-                "Do not hand-edit - re-run the generator instead."
-            ),
-            "version": spec["info"]["version"],
-        },
+        "info": {"title": title, "description": description, "version": spec["info"]["version"]},
         "servers": spec["servers"],
         "paths": filtered_paths,
         "components": kept_components,
     }
 
-    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with OUTPUT_PATH.open("w") as f:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w") as f:
         yaml.safe_dump(output, f, sort_keys=False, width=100)
 
     n_schemas = len(kept_components.get("schemas", {}))
     n_params = len(kept_components.get("parameters", {}))
     n_responses = len(kept_components.get("responses", {}))
     print(
-        f"Wrote {OUTPUT_PATH} - {len(filtered_paths)} paths, "
+        f"Wrote {out_path} - {len(filtered_paths)} paths, "
         f"{n_schemas} schemas, {n_params} parameters, {n_responses} responses kept.",
         file=sys.stderr,
     )
@@ -394,10 +495,32 @@ def main() -> None:
 
     spec = load_spec(args.spec, SOURCE_URL)
     write_graph_index(spec, "v1.0", INDEX_PATH)
+    write_trimmed_spec(
+        spec,
+        KEPT_OPERATIONS_V1,
+        OUTPUT_V1_PATH,
+        "Microsoft Defender XDR (via Graph Security API, v1.0)",
+        (
+            "Trimmed slice of Microsoft's Graph v1.0 OpenAPI spec, generated by scripts/fetch_spec.py. "
+            "Covers Defender XDR Incidents (list/get/update), Advanced Hunting (runHuntingQuery) and "
+            "custom detection rules (list/get). Do not hand-edit - re-run the generator instead."
+        ),
+        supplemental=SUPPLEMENTAL_OPERATIONS_V1,
+    )
     del spec  # the parsed beta spec is large too; don't hold both in memory
 
     spec = load_spec(args.beta_spec, BETA_SOURCE_URL)
-    write_trimmed_spec(spec)
+    write_trimmed_spec(
+        spec,
+        KEPT_OPERATIONS_BETA,
+        OUTPUT_BETA_PATH,
+        "Microsoft Defender XDR (via Graph Security API, beta)",
+        (
+            "Trimmed slice of Microsoft's Graph beta OpenAPI spec, generated by scripts/fetch_spec.py. "
+            "Covers Defender XDR incident tasks and case management (cases read/update, comments, "
+            "tasks) - operations not available in v1.0. Do not hand-edit - re-run the generator instead."
+        ),
+    )
     write_graph_index(spec, "beta", BETA_INDEX_PATH)
 
 
