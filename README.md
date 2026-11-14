@@ -3,13 +3,13 @@
 MCP server for Microsoft Defender XDR: **Incidents** (plus incident tasks), **Advanced Hunting**,
 **custom detection rules** and the new unified **case management** (preview), via the Microsoft
 Graph Security API — on **v1.0** where the operation exists there, **beta** only for what v1.0
-lacks (incident tasks, case management). Never the legacy `api.security.microsoft.com` XDR host,
+lacks (incident tasks, case management, `getHuntingSchema`). Never the legacy `api.security.microsoft.com` XDR host,
 which is being retired.
 
 The tool set is **generated, not hand-written**: `scripts/fetch_spec.py` downloads Microsoft's own
 Graph v1.0 and beta OpenAPI specs and trims them to just those operations; `server.py` mounts one
-FastMCP OpenAPI provider per version so each tool hits the right base URL, giving the twenty MCP
-tools below. When Microsoft changes the underlying API, re-running the generator picks it up —
+FastMCP OpenAPI provider per version so each tool hits the right base URL, giving the twenty-three
+MCP tools below. When Microsoft changes the underlying API, re-running the generator picks it up —
 nothing here needs hand-editing to stay in sync.
 
 Beyond that default, an opt-in **`graph` toolset** gives read-only access to *all* of Microsoft
@@ -23,10 +23,12 @@ The XDR-specific advanced hunting endpoint (`api.security.microsoft.com`) is bei
 API. This project targets Graph's `/security` namespace from the start so it doesn't need a
 rewrite once the legacy host stops working.
 
-The `xdr` tools use Graph **beta**, not v1.0: custom detection rules, incident tasks and case
-management only exist in beta, and beta's incident and hunting models are a superset of v1.0's (e.g. `workspaceId` on
-`runHuntingQuery`). Microsoft doesn't formally support beta for production use and may change it,
-so a beta change can occasionally break a tool until the spec is regenerated.
+The `xdr` tools run on Graph **v1.0** wherever the operation exists there (incidents, alerts,
+hunting, detection rules - stable and production-supported) and on **beta** only for what v1.0
+lacks (incident tasks, case management, `getHuntingSchema`). The legacy XDR-specific host
+(`api.security.microsoft.com`) is never used. Microsoft doesn't formally support beta for
+production use and may change it, so a beta change can occasionally break a tool until the spec
+is regenerated.
 
 The **Event Streaming API** (push-based, Defender → Azure Event Hubs/Storage) is intentionally out
 of scope: it's not a request/response endpoint, so it doesn't fit the OpenAPI-to-MCP-tool pattern
@@ -38,7 +40,7 @@ Select toolsets with `GRAPH_MCP_TOOLSETS` (comma-separated). Default: `xdr`.
 
 | Toolset | Tools                                                     | Context cost (tool definitions) |
 |---------|-----------------------------------------------------------|---------------------------------|
-| `xdr`   | the twenty generated Defender XDR tools below           | not yet re-measured (was ~26 KB for the first eight) |
+| `xdr`   | the twenty-three generated Defender XDR tools below     | not yet re-measured (was ~26 KB for the first eight) |
 | `graph` | `graph_search_operations`, `graph_describe_operation`, `graph_get` | ~4 KB, regardless of API size   |
 
 `GRAPH_MCP_TOOLSETS=xdr,graph` enables both; `GRAPH_MCP_TOOLSETS=graph` runs only the generic tools.
@@ -74,7 +76,7 @@ see [App registration](#app-registration).
 ## Tools (`xdr` toolset)
 
 Incidents, Advanced Hunting and detection rules run on `https://graph.microsoft.com/v1.0`;
-incident tasks and case management run on `https://graph.microsoft.com/beta` (they don't exist in
+incident tasks, case management and `getHuntingSchema` run on `https://graph.microsoft.com/beta` (they don't exist in
 v1.0). The version is baked into each generated spec, so the tool table needs no per-row marker.
 
 | Tool                                | Graph operation                           | Type                                                                                                       |
@@ -83,9 +85,12 @@ v1.0). The version is baked into each generated spec, so the tool table needs no
 | `security_GetIncidents`             | `GET /security/incidents/{id}`            | read-only                                                                                                  |
 | `security_UpdateIncidents`          | `PATCH /security/incidents/{id}`          | **mutates** the tenant's incident (status, classification, assignment, etc.)                               |
 | `security_CreateIncidentComments`   | `POST /security/incidents/{id}/comments`  | **mutates**: adds an incident comment (append-only; not in Microsoft's spec, injected by the generator)     |
+| `security_ListAlerts`               | `GET /security/alerts_v2`                 | read-only (filter e.g. `incidentId eq '<id>'`; returns the full alert incl. `evidence`)                    |
+| `security_GetAlert`                 | `GET /security/alerts_v2/{id}`            | read-only (full alert object: `evidence`, `customDetails`, `additionalData`, ...)                          |
 | `security_ListIncidentTasks`        | `GET /security/incidentTasks`             | read-only                                                                                                  |
 | `security_GetIncidentTasks`         | `GET /security/incidentTasks/{id}`        | read-only                                                                                                  |
 | `security_runHuntingQuery`          | `POST /security/runHuntingQuery`          | runs a KQL query against Defender's event tables (read-only against tenant data, but modeled as an action) |
+| `security_getHuntingSchema`         | `GET /beta/security/getHuntingSchema()`   | read-only; advanced hunting table catalog (beta-only; response trimmed client-side - see below)            |
 | `security_rules_ListDetectionRules` | `GET /security/rules/detectionRules`      | read-only                                                                                                  |
 | `security_rules_GetDetectionRules`  | `GET /security/rules/detectionRules/{id}` | read-only                                                                                                  |
 
@@ -112,9 +117,10 @@ attachment writes, aren't generated.
 
 Graph also has create/update/delete for detection rules and incident tasks; they're deliberately
 not generated (add them to `KEPT_OPERATIONS_V1` / `KEPT_OPERATIONS_BETA` in the generator if you
-want them). `getHuntingSchema()` is left out
-too: it returns every table's schema in one ~240 KB response. Use `<Table> | getschema` through
-`security_runHuntingQuery` instead, one table at a time.
+want them). `getHuntingSchema()` (beta-only) is kept, but its raw response is every table's
+schema in one ~240 KB response; `src/defender_xdr_mcp/hunting_schema.py` trims it client-side
+(catalog overview by default, full columns for tables matching the `tables` filter).
+`<Table> | getschema` through `security_runHuntingQuery` remains the per-table alternative.
 
 Microsoft Graph's OpenAPI spec uses OData conventions (`$top`, `$select`, `@odata.type`, ...) for
 query parameters and some body properties. Those characters (`$`, `@`) aren't valid in an MCP tool
@@ -127,12 +133,43 @@ parameter names and Graph still gets what it expects on the wire.
 The generated tools' output schemas (the full nested Graph response model, ~18 KB per incident
 tool) are stripped in `server.py`; responses still come back as structured JSON.
 
+Two generated tools need behavior fixes because Graph itself misbehaves (both verified live):
+
+- **`security_ListIncidents` `search`** - Graph advertises `$search` on `/security/incidents` but
+  silently ignores it, with or without the `ConsistencyLevel: eventual` header (identical counts
+  for any term, including nonsense ones). `src/defender_xdr_mcp/incident_search.py` therefore
+  applies the search client-side: it auto-paginates (Graph caps `top` at 50 and never sends
+  `@odata.nextLink` here, so `$count` + `$skip` drive the paging, oldest-first with de-duplication by `id`), matches incident `displayName` case-insensitively, and returns the true
+  matched total. Separate phrases with `|` to bucket a whole backlog in one call and get a
+  `searchCounts` map. `maxResults` bounds the scan; when it runs out mid-collection the tool
+  **raises** rather than returning a partial count. `contains(displayName, ...)` in `filter` is
+  rejected by Graph (property not filterable) - use `search` instead.
+- **`security_runHuntingQuery` KQL operators** - the Graph hunting endpoint rejects queries
+  containing `eq`/`ne`/`gt`/`ge`/`lt`/`le` (even against numbers) with the opaque `Expected: ;`,
+  while the identical symbolic forms pass (verified live on v1.0, beta, and via curl outside this
+  MCP). The KQL docs list the word forms as exact synonyms, so the quirk is undocumented endpoint
+  behavior a caller can't research its way out of. `src/defender_xdr_mcp/hunting_operators.py`
+  does **not** rewrite the caller's query - it warns in the `query` description and, when a query
+  containing word-form tokens (outside string literals and `//` comments) comes back with
+  `Expected: ;`, re-raises it with a likely-cause hint
+  ("use `==`/`!=`/`>`/`>=`/`<`/`<=`") that still includes Graph's original message; other errors
+  propagate unchanged. Also note the
+  tenant's alert tables are `AlertInfo` + `AlertEvidence` (the join table: AlertId, EntityType,
+  DeviceName, AccountUpn, SHA256, RemoteUrl, ...); `AlertDevices`/`AlertAccounts`/`AlertEvents`
+  do not exist in the catalog (see `security_getHuntingSchema`).
+
+For the same reason: the Graph alert entity has **no** `devices`/`users` properties (they are not
+dropped by this server - `$select=devices` errors on the wire). Alert attribution lives in the
+`evidence` array (`deviceEvidence.deviceDnsName`, `userEvidence.userAccount.userPrincipalName`,
+`fileEvidence.fileDetails.sha256`, `urlEvidence.url`, ...), which `security_ListAlerts` /
+`security_GetAlert` return in full.
+
 Six tools write to the tenant: `security_UpdateIncidents`, `security_CreateIncidentComments`,
 `security_caseManagement_UpdateCases`, `security_caseManagement_cases_CreateActivities`,
 `security_caseManagement_cases_CreateTasks` and `security_caseManagement_cases_UpdateTasks`, i.e.
 every PATCH and every POST except `security_runHuntingQuery`. If you wire this into an MCP client
-with allow/ask permission rules (e.g. Claude Code), put those six in `ask` and the other fourteen
-in `allow`. See
+with allow/ask permission rules (e.g. Claude Code), put those six in `ask` and the other
+seventeen in `allow`. See
 `src/defender_xdr_mcp/server.py` for the route map.
 
 ## App registration
@@ -144,7 +181,8 @@ on Microsoft Graph:
 |----------------------------------|----------------------------------------------------------------------------------------------------------------------------------------|
 | `SecurityIncident.Read.All`      | list/get incidents                                                                                                                     |
 | `SecurityIncident.ReadWrite.All` | update incidents and add incident comments (skip this if you only want read access — drop `security_UpdateIncidents` and `security_CreateIncidentComments` from your MCP client's tool allow-list too) |
-| `ThreatHunting.Read.All`         | `runHuntingQuery`                                                                                                                      |
+| `SecurityAlert.Read.All`         | `security_ListAlerts` / `security_GetAlert`                                                                                            |
+| `ThreatHunting.Read.All`         | `runHuntingQuery`, `getHuntingSchema`                                                                                                  |
 | `CustomDetection.Read.All`       | list/get custom detection rules                                                                                                        |
 | `CaseManagement.Read.All`        | read cases, activities, tasks, relations, attachments, case type configurations                                                         |
 | `CaseManagement.ReadWrite.All`   | update cases, add comments, create/update case tasks (skip it for read-only and keep those four tools out of the allow-list)            |
@@ -230,7 +268,7 @@ with `"env": {"AZURE_TENANT_ID": "${AZURE_TENANT_ID}", ...}` — Claude Code exp
 your environment at startup, so the secret itself never needs to appear in any file or command.
 
 Then extend `~/.claude/settings.json`'s `permissions.allow` / `permissions.ask` the same way it's
-already split for the other connected MCP servers: the fourteen read-only tools in `allow`, the
+already split for the other connected MCP servers: the seventeen read-only tools in `allow`, the
 six writing tools (`mcp__defender-xdr__security_UpdateIncidents`,
 `mcp__defender-xdr__security_CreateIncidentComments`,
 `mcp__defender-xdr__security_caseManagement_UpdateCases`,

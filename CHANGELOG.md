@@ -7,83 +7,76 @@ All notable changes to this project are documented here. The format follows
 Tool names are generated from Microsoft's Graph `operationId`s. A regenerated spec can rename or
 change tools even when this project's code didn't change, so spec regenerations are listed too.
 
+## [0.7.0] - 2026-11-14
+
+### Added
+- `security_ListAlerts` / `security_GetAlert` (`GET /security/alerts_v2[/{id}]`, v1.0): full alert
+  objects incl. `evidence`, `customDetails`, `additionalData`. Graph's alert entity has no
+  `devices`/`users` properties; attribution (device, user, matched hash/indicator) lives in
+  `evidence`. Needs `SecurityAlert.Read.All`. The deprecated `/security/alerts` is not kept.
+- `security_getHuntingSchema` (`GET /beta/security/getHuntingSchema()`): the advanced hunting
+  catalog, trimmed client-side from ~240 KB (`hunting_schema.py`). Without `tables`: one row per
+  table (name, description, column count). With `tables` (comma-separated substrings/globs, or a
+  list): the matching tables' columns. Built-in KQL functions are dropped, saved functions kept.
+
+### Changed
+- **`security_ListIncidents` honors `search` client-side** (`incident_search.py`): Graph silently
+  ignores `$search` on `/security/incidents`, so counts were wrong. The tool scans the filtered
+  collection oldest-first with `$count`+`$skip` and matches `displayName` case-insensitively.
+  `|` separates phrases, and `searchCounts` gives a per-phrase count (buckets may overlap).
+  `maxResults` (default 5000) caps the scan, which **raises** rather than returning partial counts;
+  incidents leaving the filter mid-scan are compensated for. In search mode `top`/`skip`/`orderby`
+  apply to the matches (`top: 0` = counts only), and rows default to five fields unless `select`
+  is given.
+- **`security_runHuntingQuery` explains the word-form operator quirk** (`hunting_operators.py`):
+  the endpoint rejects `eq`/`ne`/`gt`/`ge`/`lt`/`le` with `400 "Expected: ;"` although KQL defines
+  them as synonyms. The query is never rewritten; the parameter description warns, and that error
+  is re-raised with a hint to use `==`/`!=`/`>`/`>=`/`<`/`<=`.
+- **429/5xx backoff for every tool** (`auth.RetryingAsyncClient`): 429 retried for any method,
+  5xx for GET only, honoring `Retry-After` (capped at 60s per wait, 5 retries). Proxy environment
+  variables keep working.
+
+### Removed
+- `search` parameter of `security_ListAlerts` (not supported by alerts_v2; dropped in the generator
+  via `DROPPED_PARAMETERS_V1`).
+
+### Verified live (anonymized, see AGENTS.md)
+- Multi-phrase `search` over the open backlog: every bucket count matched an independent raw
+  `$skip` scan.
+- An incident's alerts via `ListAlerts` (`incidentId eq '<id>'`) and `GetAlert` yield device, user
+  and matched indicator; `AlertEvidence` with `==` joins the same alert (`eq` fails).
+- `test_incident_comments.py` live PASS: comments are append-only, max 1000 characters.
+- `check_schema_safety.py`: 26 tools ALL SAFE.
+
 ## [0.6.0] - 2026-11-13
 
 ### Added
-- `security_CreateIncidentComments` (`POST /security/incidents/{id}/comments`, Graph **v1.0**):
-  adds a comment to a Defender incident. This is the only supported way to write incident comments -
-  a comment placed in the `security_UpdateIncidents` PATCH body is accepted (200) but silently
-  dropped, and incident comments are append-only (Graph rejects PATCH/DELETE on an individual
-  comment). The accepted discriminator is `#microsoft.graph.security.alertComment`
-  (`#microsoft.graph.security.comment` and `#microsoft.graph.security.incidentComment` are rejected
-  with `Invalid OData type specified`); the tool makes it optional (the action accepts a bare
-  `comment`) with that value as the default.
-  This endpoint is **missing from Microsoft's OpenAPI spec** (only the alert-level `SetComments` is
-  listed), so `scripts/fetch_spec.py` now injects it via a `SUPPLEMENTAL_OPERATIONS_V1` block -
-  hand-authored path-item fragments merged into the trimmed spec before component closure, so the
-  tool is still produced by the normal generation pipeline rather than hand-written.
-  Note: this is a tenant-mutating tool - add it to your MCP client's `ask` rules alongside the
-  other writes; it needs the already-required `SecurityIncident.ReadWrite.All`.
-- `scripts/test_update_incidents.py` and `scripts/test_incident_comments.py`: integration tests for
-  the two incident write tools. Part 1 runs offline over an httpx MockTransport and asserts the
-  serialized body; part 2 runs against a real incident when `DEFENDER_TEST_INCIDENT_ID` + real
-  `AZURE_*` creds are set.
+- `security_CreateIncidentComments` (`POST /security/incidents/{id}/comments`, v1.0), the only way
+  to write incident comments: comments in the `UpdateIncidents` PATCH body are accepted but
+  silently dropped. The endpoint is missing from Microsoft's spec and is injected by the generator
+  (`SUPPLEMENTAL_OPERATIONS_V1`). The `@odata.type` defaults to
+  `#microsoft.graph.security.alertComment`, the only value Graph accepts. Mutates the tenant
+  (`ask` list); needs `SecurityIncident.ReadWrite.All`.
+- `scripts/test_update_incidents.py` / `scripts/test_incident_comments.py`: offline body
+  serialization test, plus a live part when `DEFENDER_TEST_INCIDENT_ID` and real creds are set.
 
 ### Changed
-- **API version split.** The `xdr` tools no longer all run on Graph beta. The generator now emits
-  two trimmed specs and `server.py` mounts one OpenAPI provider per version, each rooted at the
-  right base URL:
-  - **v1.0** (`security_v1.generated.yaml`): `security_ListIncidents` / `security_GetIncidents` /
-    `security_UpdateIncidents`, `security_runHuntingQuery`, `security_rules_ListDetectionRules` /
-    `security_rules_GetDetectionRules`. These all exist in v1.0, which is stable and production-
-    supported (beta is explicitly "not supported in production"). Custom detection rules moved from
-    beta to v1.0 (they are GA there).
-  - **beta** (`security_beta.generated.yaml`): incident tasks and case management - the operations
-    that do not exist in v1.0.
-  Tool names are unchanged (the v1.0 `operationId`s match the beta ones exactly), so no MCP client
-  permission rules need updating. The legacy `api.security.microsoft.com` XDR host is, as before,
-  never used.
-- `scripts/fetch_spec.py` now takes `KEPT_OPERATIONS_V1` / `KEPT_OPERATIONS_BETA` and writes
-  `security_v1.generated.yaml` + `security_beta.generated.yaml` (the old single
-  `security.generated.yaml` is gone). Verified against live Graph: v1.0 incident update, hunting,
-  detection rules and beta incident tasks / cases all respond correctly.
-- `security_UpdateIncidents` no longer advertises `comments`. Graph accepts them in the PATCH body
-  but never stores them, so the field only invited silent no-ops; use
-  `security_CreateIncidentComments`. The `patch_body.py` hook drops the field from the schema and
-  from any body a client still sends.
-- **One shared MSAL token cache.** `build_server()` now builds a single `ClientCredentialsAuth`
-  (`auth.build_auth()`) and passes it to every httpx client it creates - the v1.0 provider, the
-  beta provider and the `graph` toolset's client. Each auth owns its own
-  `ConfidentialClientApplication`, so before this each of those clients acquired its own Graph
-  token at startup (three client-credentials round-trips with both toolsets enabled, up from one).
-- Refreshed all dependencies in `uv.lock` (`uv lock --upgrade`): **fastmcp 4.1.5 → 4.2.0** plus
-  transitive bumps (pydantic, authlib, cachetools 7→8, cyclopts, sse-starlette, ...). No packages
-  added or removed; direct deps `httpx2`, `msal`, `pyyaml` and `python-dotenv` were already current.
+- **API version split**: incidents, hunting and custom detection rules (GA there) run on Graph
+  **v1.0**; incident tasks and case management stay on **beta**. The generator writes
+  `security_v1.generated.yaml` + `security_beta.generated.yaml` (`KEPT_OPERATIONS_V1` /
+  `_BETA`), and `server.py` mounts one provider per version. Tool names are unchanged.
+- `security_UpdateIncidents` no longer advertises `comments` (silently ignored by Graph).
+- One shared MSAL token cache across all HTTP clients (was one token acquisition per client).
+- Dependencies refreshed: fastmcp 4.1.5 → 4.2.0 plus transitive bumps.
 
 ### Fixed
-- `security_UpdateIncidents` failed every call with `400 InvalidRequestBody` - the tool was
-  effectively non-functional. The spec models the PATCH body as the full incident schema, which
-  marks `@odata.type` as a *required* discriminator, so FastMCP advertised it as a required
-  top-level argument and every request sent `{"@odata.type": "#microsoft.graph.security.incident",
-  ...}`. Graph's `PATCH /security/incidents/{id}` already knows the type from the URL and rejects a
-  body carrying the resource's own discriminator (verified live on beta: the same body without it
-  returns 200). New `patch_body.py` hook (registered in `server.py`) drops that top-level
-  discriminator from the advertised schema and the outgoing body for PATCH tools.
-- `schema_sanitize.py` now sanitizes OData names **recursively**, through every subschema keyword
-  (`items`, combinators, `$defs`, `patternProperties`, `if`/`then`/`else`, ...). It previously only
-  touched top-level properties, so nested discriminators Graph genuinely needs - a case activity's
-  `@odata.type`, nested types under `security_caseManagement_UpdateCases` /
-  `security_caseManagement_cases_UpdateTasks` - kept a literal `@` in the advertised schema (invalid
-  to the MCP key regex) and were never translated back.
-- `required` entries are renamed directly, so a type that requires `@odata.type` declared on a base
-  type (reached via `allOf`/`$ref`) no longer advertises an unsanitized required name.
-- Argument translation now follows the original schema (`$ref`s resolved) instead of one flat rename
-  table, so only declared OData properties are renamed. Free-form user data - e.g. a key named
-  `filter`, `select` or `odata.type` inside a `customFields` map - is no longer rewritten to
-  `$filter`/`$select`/`@odata.type` on the way to Graph.
-- `scripts/check_schema_safety.py` now checks property names (and `required` entries) at every
-  schema depth, including `$defs`, using the same subschema iterator as `schema_sanitize.py`
-  (`iter_subschemas`), so the check and the sanitizer can't drift apart.
+- `security_UpdateIncidents` failed every call with `400 InvalidRequestBody`: the spec's required
+  top-level `@odata.type` was sent, and Graph rejects it on PATCH. New `patch_body.py` hook drops it.
+- `schema_sanitize.py` sanitizes OData names recursively (nested properties, combinators, `$defs`,
+  `required`), so nested discriminators are advertised validly and translated back. Translation
+  follows the schema, so free-form keys such as `filter` inside `customFields` are no longer
+  rewritten.
+- `check_schema_safety.py` checks every schema depth, using the sanitizer's own subschema iterator.
 
 ## [0.4.2] - 2026-11-02
 
@@ -159,7 +152,8 @@ change tools even when this project's code didn't change, so spec regenerations 
 ### Fixed
 - Spec shipped as package data so `uv tool install` works outside the checkout.
 
-[0.6.0]: https://github.com/WildDogOne/DefenderXDRMCP/compare/f995f08...HEAD
+[0.7.0]: https://github.com/WildDogOne/DefenderXDRMCP/compare/2bdd890...HEAD
+[0.6.0]: https://github.com/WildDogOne/DefenderXDRMCP/compare/f995f08...2bdd890
 [0.4.2]: https://github.com/WildDogOne/DefenderXDRMCP/compare/7345d77...f995f08
 [0.4.1]: https://github.com/WildDogOne/DefenderXDRMCP/compare/d945277...7345d77
 [0.4.0]: https://github.com/WildDogOne/DefenderXDRMCP/compare/aee7dcc...d945277

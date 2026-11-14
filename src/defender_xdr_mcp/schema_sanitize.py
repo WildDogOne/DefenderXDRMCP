@@ -38,6 +38,8 @@ import re
 from collections.abc import Iterator
 from typing import Any
 
+from ._hooks import wrap_run
+
 _SAFE_KEY = re.compile(r"^[a-zA-Z0-9_.-]{1,64}$")
 
 # JSON Schema keywords that hold subschemas, grouped by shape. ``properties`` is handled separately
@@ -186,13 +188,8 @@ def sanitize_component(route: Any, component: Any) -> None:
     if not _walk_schema(schema):
         return  # nothing to do - most non-Graph, non-OData operations won't hit this at all
 
-    original_run = component.run
-
-    async def run_with_odata_names(arguments: dict[str, Any], _orig=original_run, _schema=original_schema):
+    async def run_with_odata_names(arguments: dict[str, Any], _orig, _schema=original_schema):
         translated = _translate_arguments(arguments, _schema, _schema)
         return await _orig(translated)
 
-    # pydantic models (component's base class) reject setting a non-field attribute, so the rebind
-    # uses object.__setattr__ to bypass that - standard when patching behavior onto a pydantic
-    # instance post-construction, not a hack around a bug.
-    object.__setattr__(component, "run", run_with_odata_names)
+    wrap_run(component, run_with_odata_names)

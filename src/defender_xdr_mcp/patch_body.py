@@ -37,6 +37,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from ._hooks import wrap_run
+
 _DISCRIMINATOR_NAMES = ("@odata.type", "odata.type")
 
 # Tool name -> top-level body fields Graph accepts on PATCH but does not persist.
@@ -64,13 +66,9 @@ def strip_patch_discriminator(route: Any, component: Any) -> None:
     if schema.get("required"):
         schema["required"] = [name for name in schema["required"] if name not in drop]
 
-    original_run = component.run
-
-    async def run_without_dropped(arguments: dict[str, Any], _orig=original_run, _drop=frozenset(drop)):
+    async def run_without_dropped(arguments: dict[str, Any], _orig, _drop=frozenset(drop)):
         # Only top-level body fields are dropped; nested discriminators (inside lists/objects) stay.
         cleaned = {name: value for name, value in arguments.items() if name not in _drop}
         return await _orig(cleaned)
 
-    # pydantic models (component's base class) reject setting a non-field attribute, so the
-    # rebind uses object.__setattr__ to bypass that - same pattern as schema_sanitize.py.
-    object.__setattr__(component, "run", run_without_dropped)
+    wrap_run(component, run_without_dropped)

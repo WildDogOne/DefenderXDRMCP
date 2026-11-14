@@ -5,9 +5,9 @@ https://github.com/microsoftgraph/msgraph-metadata and slices out just the opera
 exposes as `xdr` MCP tools, split across two generated specs by API version:
 
   - security_v1.generated.yaml   - Graph **v1.0**: Defender XDR Incidents (list / get / update),
-    Advanced Hunting (runHuntingQuery), custom detection rules (list / get).
-  - security_beta.generated.yaml - Graph **beta**: incident tasks, and case management cases
-    (read / update, comments, tasks).
+    alerts (list / get), Advanced Hunting (runHuntingQuery), custom detection rules (list / get).
+  - security_beta.generated.yaml - Graph **beta**: incident tasks, the advanced hunting table
+    catalog (getHuntingSchema), and case management cases (read / update, comments, tasks).
 
 The rule is: use **v1.0** wherever the operation exists there (stable, production-supported), and
 **beta** only for operations that do not (incident tasks, case management). Never the legacy
@@ -69,19 +69,42 @@ YAML_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
 # except runHuntingQuery (case comments and case tasks). Detection rules and incident tasks are
 # read-only here even though Graph also offers create/update/delete for them - add the method
 # below (and an `ask` permission rule) if that's ever wanted.
-# getHuntingSchema() is deliberately left out: it returns every table's schema in one ~240 KB
-# response with no filter. `<Table> | getschema` via runHuntingQuery covers the same need per table.
+# getHuntingSchema() (beta only; not in the v1.0 spec) is kept, but the raw response is every
+# table's full schema in one ~240 KB blob with no server-side filter - hunting_schema.py trims it
+# (table overview by default, full columns via a `tables` argument) so it fits an agent context.
+# `<Table> | getschema` via runHuntingQuery covers the same need per table.
+# The alerts_v2 pair is the current Defender alert entity (microsoft.graph.security.alert) - the
+# one incidents reference. It carries the full alert object: evidence (device/user/url/process/file
+# entities with deviceDnsName, userPrincipalName, sha256, url ...), customDetails and additionalData.
+# The Graph alert entity has NO devices/users properties (verified live: $select=devices errors), so
+# alert attribution comes from evidence - the deprecated /security/alerts returns 404 for XDR alert
+# ids and is not kept.
 KEPT_OPERATIONS_V1: dict[str, set[str]] = {
     "/security/incidents": {"get"},
     "/security/incidents/{incident-id}": {"get", "patch"},
+    "/security/alerts_v2": {"get"},
+    "/security/alerts_v2/{alert-id}": {"get"},
     "/security/microsoft.graph.security.runHuntingQuery": {"post"},
     "/security/rules/detectionRules": {"get"},
     "/security/rules/detectionRules/{detectionRule-id}": {"get"},
 }
+# Query parameters the upstream spec advertises on a kept operation but the live endpoint doesn't
+# honor - dropped from the generated spec so callers can't rely on a silently ignored filter.
+#   - $search on alerts_v2: not among the documented query parameters of List alerts_v2
+#     ($count/$filter/$skip/$top, https://learn.microsoft.com/graph/api/security-list-alerts_v2),
+#     and the sibling /security/incidents collection silently ignores it (verified live; that one
+#     is kept and implemented client-side by incident_search.py instead).
+DROPPED_PARAMETERS_V1: dict[tuple[str, str], set[str]] = {
+    ("/security/alerts_v2", "get"): {"search"},
+}
+
 KEPT_OPERATIONS_BETA: dict[str, set[str]] = {
     # Incident tasks exist only in beta.
     "/security/incidentTasks": {"get"},
     "/security/incidentTasks/{incidentTask-id}": {"get"},
+    # The advanced hunting table catalog (tables + columns + types); beta-only, see the
+    # trimming hook in hunting_schema.py.
+    "/security/microsoft.graph.security.getHuntingSchema()": {"get"},
     # Unified case management (preview) is beta-only. Cases are read + updated (status, assignee,
     # priority, custom fields); comments are added as activities; tasks are listed, created and
     # updated. Creating/deleting cases, relation and attachment writes are left out.
@@ -274,6 +297,7 @@ def write_trimmed_spec(
     title: str,
     description: str,
     supplemental: dict[str, dict[str, Any]] | None = None,
+    dropped_parameters: dict[tuple[str, str], set[str]] | None = None,
 ) -> None:
     filtered_paths: dict[str, Any] = {}
     for path, methods in kept_operations.items():
@@ -285,6 +309,17 @@ def write_trimmed_spec(
         for key, value in full_path_item.items():
             if key in ("get", "post", "patch", "put", "delete", "options", "head", "trace"):
                 if key in methods:
+                    dropped = (dropped_parameters or {}).get((path, key))
+                    if dropped:
+                        value = {
+                            **value,
+                            "parameters": [
+                                param
+                                for param in value.get("parameters", [])
+                                if param.get("$ref", "").rsplit("/", 1)[-1] not in dropped
+                                and param.get("name") not in dropped
+                            ],
+                        }
                     path_item[key] = value
             else:
                 # description, parameters (path-level, e.g. incident-id), etc.
@@ -502,10 +537,12 @@ def main() -> None:
         "Microsoft Defender XDR (via Graph Security API, v1.0)",
         (
             "Trimmed slice of Microsoft's Graph v1.0 OpenAPI spec, generated by scripts/fetch_spec.py. "
-            "Covers Defender XDR Incidents (list/get/update), Advanced Hunting (runHuntingQuery) and "
-            "custom detection rules (list/get). Do not hand-edit - re-run the generator instead."
+            "Covers Defender XDR Incidents (list/get/update), alerts (list/get), Advanced Hunting "
+            "(runHuntingQuery) and custom detection rules (list/get). Do not hand-edit - re-run the "
+            "generator instead."
         ),
         supplemental=SUPPLEMENTAL_OPERATIONS_V1,
+        dropped_parameters=DROPPED_PARAMETERS_V1,
     )
     del spec  # the parsed beta spec is large too; don't hold both in memory
 
@@ -517,8 +554,9 @@ def main() -> None:
         "Microsoft Defender XDR (via Graph Security API, beta)",
         (
             "Trimmed slice of Microsoft's Graph beta OpenAPI spec, generated by scripts/fetch_spec.py. "
-            "Covers Defender XDR incident tasks and case management (cases read/update, comments, "
-            "tasks) - operations not available in v1.0. Do not hand-edit - re-run the generator instead."
+            "Covers Defender XDR incident tasks, the advanced hunting table catalog (getHuntingSchema) "
+            "and case management (cases read/update, comments, tasks) - operations not available in "
+            "v1.0. Do not hand-edit - re-run the generator instead."
         ),
     )
     write_graph_index(spec, "beta", BETA_INDEX_PATH)

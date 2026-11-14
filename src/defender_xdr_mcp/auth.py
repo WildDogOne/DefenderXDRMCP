@@ -9,6 +9,9 @@ once it's near expiry, so in steady state this thread hop is rare, not per-reque
 from __future__ import annotations
 
 import asyncio
+import datetime
+import email.utils
+import math
 import os
 
 import httpx2
@@ -68,6 +71,63 @@ def build_auth() -> ClientCredentialsAuth:
     return ClientCredentialsAuth(tenant_id, client_id, client_secret)
 
 
+# Graph throttles the Defender endpoints at ~40 requests/minute (verified live) and answers 429
+# with Retry-After. 429 means the request was not processed, so it is retried for every method.
+# 5xx is retried only for GET: a 5xx on a write may already have been applied, and retrying could
+# e.g. post a comment twice.
+_RETRY_ANY_METHOD = {429}
+_RETRY_GET_ONLY = {500, 502, 503, 504}
+_MAX_RETRIES = 5
+_DEFAULT_RETRY_AFTER = 5.0
+_MAX_RETRY_AFTER = 60.0
+
+
+def _retry_after_seconds(value: str | None) -> float:
+    """Parse Retry-After, which is either delta-seconds or an HTTP-date (RFC 9110 10.2.3)."""
+    if not value:
+        return _DEFAULT_RETRY_AFTER
+    try:
+        seconds = float(value)
+    except ValueError:
+        try:
+            when = email.utils.parsedate_to_datetime(value)
+        except (TypeError, ValueError):
+            return _DEFAULT_RETRY_AFTER
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=datetime.timezone.utc)
+        seconds = (when - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+    if not math.isfinite(seconds):  # "nan"/"inf" parse as floats and would survive the clamp
+        return _DEFAULT_RETRY_AFTER
+    return min(max(seconds, 0.0), _MAX_RETRY_AFTER)
+
+
+class RetryingAsyncClient(httpx2.AsyncClient):
+    """AsyncClient that retries throttled (429) and, for GETs, transient 5xx responses.
+
+    Honors Retry-After (each wait capped at _MAX_RETRY_AFTER seconds, at most _MAX_RETRIES retries).
+    The retry sits in ``send()`` (public API; FastMCP's generated tools call it directly and
+    ``get()``/``request()`` go through it) rather than in a custom transport: passing
+    ``transport=`` would make httpx2 skip HTTP(S)_PROXY/ALL_PROXY/NO_PROXY, so keeping httpx2's
+    own transports keeps proxy support without rebuilding it from httpx2 internals. Every tool
+    sharing the client (generated xdr tools, the ListIncidents search scan, the graph toolset)
+    gets the same backoff.
+    """
+
+    async def send(self, request: httpx2.Request, **kwargs) -> httpx2.Response:
+        for attempt in range(_MAX_RETRIES + 1):
+            response = await super().send(request, **kwargs)
+            status = response.status_code
+            retryable = status in _RETRY_ANY_METHOD or (
+                status in _RETRY_GET_ONLY and request.method == "GET"
+            )
+            if not retryable or attempt == _MAX_RETRIES:
+                return response
+            delay = _retry_after_seconds(response.headers.get("retry-after"))
+            await response.aclose()
+            await asyncio.sleep(delay)
+        raise AssertionError("unreachable")
+
+
 def build_http_client(base_url: str, auth: ClientCredentialsAuth | None = None) -> httpx2.AsyncClient:
     """Build the authenticated httpx client FastMCP will use to actually call Graph.
 
@@ -76,7 +136,8 @@ def build_http_client(base_url: str, auth: ClientCredentialsAuth | None = None) 
     sends absolute URLs, so it doesn't depend on it. Pass the shared auth from build_auth() so
     the clients don't each acquire their own token.
     """
-    return httpx2.AsyncClient(
+    # Don't pass transport=: httpx2 would then ignore the proxy environment variables.
+    return RetryingAsyncClient(
         base_url=base_url,
         auth=auth if auth is not None else build_auth(),
         # Advanced hunting queries can legitimately run for a while; Graph itself times a single

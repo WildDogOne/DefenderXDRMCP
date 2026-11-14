@@ -19,9 +19,8 @@ Usage:
     AZURE_TENANT_ID=common AZURE_CLIENT_ID=00000000-0000-0000-0000-000000000000 \
     AZURE_CLIENT_SECRET=dummy uv run python scripts/test_incident_comments.py
 
-    # plus the live happy-path add:
-    AZURE_TENANT_ID=... AZURE_CLIENT_ID=... AZURE_CLIENT_SECRET=... \
-    DEFENDER_TEST_INCIDENT_ID=177173 uv run python scripts/test_incident_comments.py
+    # plus the live happy-path add (real AZURE_* creds exported in the environment):
+    DEFENDER_TEST_INCIDENT_ID=<a-test-incident-id> uv run python scripts/test_incident_comments.py
 """
 
 import asyncio
@@ -51,15 +50,15 @@ async def _mock_part() -> None:
     tool = next(t for t in await server.list_tools() if t.name == "security_CreateIncidentComments")
 
     # Bare comment (the discriminator is optional on the wire).
-    await tool.run({"incident-id": "177173", "comment": "integration test"})
+    await tool.run({"incident-id": "9182736", "comment": "integration test"})
     req = captured[-1]
     assert req.method == "POST", req.method
-    assert req.url.path.endswith("/security/incidents/177173/comments"), str(req.url)
+    assert req.url.path.endswith("/security/incidents/9182736/comments"), str(req.url)
     assert json.loads(req.content) == {"comment": "integration test"}, req.content
 
     # Explicit discriminator is translated back to the literal @odata.type Graph needs.
     await tool.run(
-        {"incident-id": "177173", "odata.type": "#microsoft.graph.security.alertComment", "comment": "typed"}
+        {"incident-id": "9182736", "odata.type": "#microsoft.graph.security.alertComment", "comment": "typed"}
     )
     assert json.loads(captured[-1].content) == {
         "@odata.type": "#microsoft.graph.security.alertComment",

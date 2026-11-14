@@ -21,9 +21,8 @@ Usage:
     AZURE_TENANT_ID=common AZURE_CLIENT_ID=00000000-0000-0000-0000-000000000000 \
     AZURE_CLIENT_SECRET=dummy uv run python scripts/test_update_incidents.py
 
-    # plus the live happy-path update:
-    AZURE_TENANT_ID=... AZURE_CLIENT_ID=... AZURE_CLIENT_SECRET=... \
-    DEFENDER_TEST_INCIDENT_ID=177173 uv run python scripts/test_update_incidents.py
+    # plus the live happy-path update (real AZURE_* creds exported in the environment):
+    DEFENDER_TEST_INCIDENT_ID=<a-test-incident-id> uv run python scripts/test_update_incidents.py
 """
 
 import asyncio
@@ -49,7 +48,7 @@ async def _mock_part() -> None:
 
     def handler(request: httpx2.Request) -> httpx2.Response:
         captured.append(request)
-        return httpx2.Response(200, json={"id": "177173"}, request=request)
+        return httpx2.Response(200, json={"id": "9182736"}, request=request)
 
     srv.build_http_client = lambda base_url, **kwargs: httpx2.AsyncClient(
         base_url=base_url, transport=httpx2.MockTransport(handler)
@@ -70,7 +69,7 @@ async def _mock_part() -> None:
     # Even if a client sends the dropped fields anyway (stale schema), they must not reach Graph.
     await tool.run(
         {
-            "incident-id": "177173",
+            "incident-id": "9182736",
             "classification": EXPECTED_BODY["classification"],
             "determination": EXPECTED_BODY["determination"],
             "odata.type": "#microsoft.graph.security.incident",
@@ -80,7 +79,7 @@ async def _mock_part() -> None:
 
     request = captured[0]
     assert request.method == "PATCH", request.method
-    assert request.url.path.endswith("/security/incidents/177173"), str(request.url)
+    assert request.url.path.endswith("/security/incidents/9182736"), str(request.url)
     sent = json.loads(request.content)
     assert sent == EXPECTED_BODY, f"body mismatch:\n  sent  ={sent}\n  expect={EXPECTED_BODY}"
     assert "@odata.type" not in sent, "top-level discriminator leaked into the body"

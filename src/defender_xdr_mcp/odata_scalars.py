@@ -24,6 +24,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from ._hooks import wrap_run
+
 
 def normalize_odata_scalars(route: Any, component: Any) -> None:
     """FastMCP mcp_component_fn hook: lowercase booleans before request building."""
@@ -42,10 +44,8 @@ def normalize_odata_scalars(route: Any, component: Any) -> None:
         if isinstance(prop, dict) and prop.get("type") == "boolean"
     }
 
-    original_run = component.run
-
     async def run_with_scalar_booleans(
-        arguments: dict[str, Any], _orig=original_run, _bp=bool_params
+        arguments: dict[str, Any], _orig, _bp=bool_params
     ):
         fixed = {}
         for name, value in arguments.items():
@@ -61,6 +61,4 @@ def normalize_odata_scalars(route: Any, component: Any) -> None:
                 fixed[name] = value
         return await _orig(fixed)
 
-    # pydantic models (component's base class) reject setting a non-field attribute, so the
-    # rebind uses object.__setattr__ to bypass that - same pattern as schema_sanitize.py.
-    object.__setattr__(component, "run", run_with_scalar_booleans)
+    wrap_run(component, run_with_scalar_booleans)
