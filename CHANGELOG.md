@@ -7,6 +7,17 @@ All notable changes to this project are documented here. The format follows
 Tool names are generated from Microsoft's Graph `operationId`s. A regenerated spec can rename or
 change tools even when this project's code didn't change, so spec regenerations are listed too.
 
+## [0.8.0] - 2026-11-26
+
+### Changed
+- Dependency refresh, tool surface unchanged: fastmcp/fastmcp-slim 4.2.0 -> 4.2.6,
+  httpx2/httpcore2 2.16.0 -> 2.16.2, pydantic 2.14.4, cyclopts 5.5.3, py-key-value-aio 0.5.0,
+  plus routine patches (certifi, pyyaml, packaging, platformdirs, ...). `uv audit`: no known
+  vulnerabilities. Relevant fastmcp behavior changes: 4.2.5 stops OpenAPI tools from forwarding
+  MCP transport headers to the wrapped API and enables `subscriptions/listen` streams by default
+  (HTTP transport only, unaffected over stdio); 4.2.6 no longer pulls `authlib`, which this
+  project never imported directly.
+
 ## [0.7.0] - 2026-11-14
 
 ### Added
