@@ -7,6 +7,16 @@ All notable changes to this project are documented here. The format follows
 Tool names are generated from Microsoft's Graph `operationId`s. A regenerated spec can rename or
 change tools even when this project's code didn't change, so spec regenerations are listed too.
 
+## [0.9.0] - 2026-11-28
+
+### Changed
+- Dependency refresh, tool surface unchanged: cachetools 8.0.2 -> 8.0.3 (fixes recursive
+  calls with the same cache key waiting forever in `@cached`/`@cachedmethod` with `condition`),
+  platformdirs 4.14.8 -> 4.14.9 (Android device-protected-storage detection fix). Both
+  transitive (`py-key-value-aio`, `fastmcp-slim`); no direct dependency moved - fastmcp 4.2.6
+  and httpx2 2.16.2 were already current. `pip-audit` over the full lockfile: no known
+  vulnerabilities.
+
 ## [0.8.0] - 2026-11-26
 
 ### Changed
